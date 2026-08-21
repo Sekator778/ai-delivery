@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(dirname "$0")"
+source "$SCRIPT_DIR/botctl-common.sh"
+
+require_cmd curl
+require_cmd jq
+require_cmd ffmpeg
+require_cmd mktemp
+
+load_env
+TTS_URL="${TTS_URL:-http://127.0.0.1:8768/synthesize}"
+
+text=""
+if [[ $# -ge 1 ]]; then
+    text="$1"
+else
+    text=$(cat)
+fi
+
+text="${text%"${text##*[![:space:]]}"}"
+
+if [[ -z "$text" ]]; then
+    exit 0
+fi
+
+chat_id=$(target_chat_id)
+
+last_user=$(state_get last_user)
+if [[ -n "$last_user" && "$last_user" != "null" ]]; then
+    voice_mode=$(jq -r --arg u "$last_user" \
+        '.users[$u].voice_mode // "off"' "$STATE_FILE" 2>/dev/null)
+    voice=$(jq -r --arg u "$last_user" \
+        '.users[$u].voice // "eugene"' "$STATE_FILE" 2>/dev/null)
+else
+    voice_mode="off"
+    voice="eugene"
+fi
+
+if [[ "$voice_mode" != "on" || "${#text}" -gt 1500 ]]; then
+    clean_text=$(echo "$text" | sed 's/<[^>]*>//g')
+    exec "$SCRIPT_DIR/botctl-send-text" "$clean_text"
+fi
+
+tmp_wav=""
+tmp_ogg=""
+
+cleanup() {
+    [[ -n "$tmp_wav" && -f "$tmp_wav" ]] && rm -f "$tmp_wav"
+    [[ -n "$tmp_ogg" && -f "$tmp_ogg" ]] && rm -f "$tmp_ogg"
+}
+trap cleanup EXIT
+
+tmp_wav=$(mktemp).wav
+tmp_ogg=$(mktemp).ogg
+
+payload=$(jq -n --arg t "$text" --arg v "$voice" \
+    '{text:$t, voice:$v, sample_rate:48000}')
+
+code=$(curl -s -o "$tmp_wav" -w "%{http_code}" -X POST "$TTS_URL" \
+    -H 'Content-Type: application/json' -d "$payload" --max-time 60)
+
+if [[ "$code" != "200" || ! -s "$tmp_wav" ]]; then
+    echo "ERROR: TTS synthesis failed (HTTP $code), falling back to text" >&2
+    rm -f "$tmp_wav" "$tmp_ogg"
+    clean_text=$(echo "$text" | sed 's/<[^>]*>//g')
+    exec "$SCRIPT_DIR/botctl-send-text" "$clean_text"
+fi
+
+ffmpeg -y -i "$tmp_wav" -c:a libopus -b:a 32k "$tmp_ogg" \
+    >/dev/null 2>&1
+
+tg_api sendVoice -F "chat_id=${chat_id}" -F "voice=@${tmp_ogg}" >/dev/null

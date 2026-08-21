@@ -1,0 +1,392 @@
+# AI Delivery — real-mode pipeline (Windmill conductor, roadmap 4.2).
+#
+# Cross-model and PROVIDER-AGNOSTIC. Each AI stage reads its role config from a
+# Windmill variable (model_coder / model_reviewer) holding {model, api_key, base_url}.
+# Swap a provider = edit that variable, no flow change. base_url empty -> Anthropic;
+# base_url set -> any Anthropic-compatible endpoint (z.ai, Moonshot, OpenRouter, ...).
+#
+# Resilience (MultiAgent dev guide, section 6): every AI stage has a hard turn
+# limit (--max-turns, sect. 6.3), a module timeout and retry on transient
+# provider errors (sect. 6.2); a failed agent call stops the flow instead of
+# proceeding on broken state; a run_id correlation id is threaded through every
+# stage and every result (sect. 6.8).
+#
+#   prepare -> test_design(reviewer) -> implement(coder) -> gate(mvn)
+#                                            ^                  |
+#                          rework(coder) <-- review(reviewer) <-+ (gate pass)
+#                                            |
+#                                            v  review clean
+#                                     knowledge -> deliver -> Pull Request
+#
+# Deploy: wmill flow push windmill/flows/ai-delivery-real.flow f/ai_delivery/pipeline_real \
+#           --workspace ai-delivery --base-url http://localhost/ --token <TOKEN>
+summary: AI Delivery - real cross-model pipeline
+description: >-
+  Provider-agnostic cross-model conductor: each stage uses its role config
+  (model_coder / model_reviewer). clone -> test_design -> implement -> gate ->
+  review -> (rework if requested) -> knowledge -> deliver (PR).
+value:
+  same_worker: true
+  modules:
+    - id: prepare
+      summary: Clone repo and create a branch
+      value:
+        type: rawscript
+        language: bash
+        input_transforms:
+          github_token:
+            type: javascript
+            expr: 'variable("u/admin/github_token")'
+        content: |
+          set -euo pipefail
+          github_token="$1"
+          job_dir="$(pwd)"
+          run_id="$(date +%Y%m%d-%H%M%S)"
+          branch="ai-delivery/run-${run_id}"
+          echo "[run=${run_id}] stage=prepare start"
+          mkdir -p shared
+          rm -rf shared/repo
+          git clone --depth 1 "https://x-access-token:${github_token}@github.com/Sekator778/registration-service.git" shared/repo
+          cd shared/repo
+          git config user.email "conductor@ai-delivery.local"
+          git config user.name "AI Delivery Conductor"
+          git checkout -b "$branch"
+          cd "$job_dir"
+          echo "[run=${run_id}] stage=prepare status=ok branch=${branch}"
+          echo "{\"run_id\":\"${run_id}\",\"branch\":\"${branch}\",\"status\":\"cloned\"}" > result.json
+      timeout: 600
+    - id: test_design
+      summary: Contract tests (reviewer role)
+      value:
+        type: rawscript
+        language: bash
+        input_transforms:
+          model_cfg:
+            type: javascript
+            expr: 'variable("u/admin/model_reviewer")'
+          task_text:
+            type: javascript
+            expr: 'flow_input.task_text'
+          run_id:
+            type: javascript
+            expr: 'results.prepare.run_id'
+        content: |
+          set -uo pipefail
+          model_cfg="$1"
+          task_text="$2"
+          run_id="${3:-unknown}"
+          [ -z "${task_text:-}" ] && { echo "ERROR: task_text empty"; exit 1; }
+          job_dir="$(pwd)"
+          export ANTHROPIC_MODEL="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin)["model"])')"
+          akey="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin)["api_key"])')"
+          abase="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("base_url",""))')"
+          if [ -n "$abase" ]; then export ANTHROPIC_BASE_URL="$abase"; export ANTHROPIC_AUTH_TOKEN="$akey"; export ANTHROPIC_API_KEY=""; else export ANTHROPIC_API_KEY="$akey"; fi
+          export IS_SANDBOX=1
+          echo "[run=${run_id}] stage=test_design model=${ANTHROPIC_MODEL} start"
+          cd shared/repo
+          prompt="You are the TEST-DESIGN stage of an automated cross-model delivery pipeline. The working directory is a Maven Spring Boot repository (Java 21). First read AGENTS.md and memory-bank/index.md + memory-bank/current-state.md to learn the project conventions and what already exists. Then write JUnit 5 tests under src/test that act as an executable CONTRACT for this task: ${task_text}
+          The tests verify externally observable behaviour and cover edge cases. A DIFFERENT, cheaper model implements the code against them, so be precise. Do NOT write production code under src/main. Do NOT run git or mvn. Finish when the contract tests are written under src/test."
+          printf '%s' "$prompt" | claude -p --dangerously-skip-permissions --max-turns 50 > /tmp/test_design.out 2>&1
+          rc=$?
+          tail -20 /tmp/test_design.out
+          cd "$job_dir"
+          if [ "$rc" -ne 0 ]; then
+            echo "[run=${run_id}] stage=test_design status=error claude_exit=${rc}"
+            echo "{\"stage\":\"test_design\",\"status\":\"error\",\"claude_exit\":${rc},\"run_id\":\"${run_id}\"}" > result.json
+            exit "$rc"
+          fi
+          echo "[run=${run_id}] stage=test_design status=ok"
+          echo "{\"stage\":\"test_design\",\"model\":\"${ANTHROPIC_MODEL}\",\"run_id\":\"${run_id}\"}" > result.json
+      retry:
+        exponential:
+          attempts: 2
+          multiplier: 2
+          seconds: 20
+      timeout: 1200
+    - id: implement
+      summary: Implement code (coder role)
+      value:
+        type: rawscript
+        language: bash
+        input_transforms:
+          model_cfg:
+            type: javascript
+            expr: 'variable("u/admin/model_coder")'
+          task_text:
+            type: javascript
+            expr: 'flow_input.task_text'
+          run_id:
+            type: javascript
+            expr: 'results.prepare.run_id'
+        content: |
+          set -uo pipefail
+          model_cfg="$1"
+          task_text="$2"
+          run_id="${3:-unknown}"
+          job_dir="$(pwd)"
+          export ANTHROPIC_MODEL="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin)["model"])')"
+          akey="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin)["api_key"])')"
+          abase="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("base_url",""))')"
+          if [ -n "$abase" ]; then export ANTHROPIC_BASE_URL="$abase"; export ANTHROPIC_AUTH_TOKEN="$akey"; export ANTHROPIC_API_KEY=""; else export ANTHROPIC_API_KEY="$akey"; fi
+          export IS_SANDBOX=1
+          echo "[run=${run_id}] stage=implement model=${ANTHROPIC_MODEL} start"
+          cd shared/repo
+          prompt="You are the IMPLEMENT stage of a fully automated delivery pipeline. Never ask questions; make reasonable assumptions. Working dir is a Maven Spring Boot repo (Java 21). First read AGENTS.md and memory-bank/current-state.md to follow the conventions and avoid duplicating what already exists. Contract tests are ALREADY written under src/test by another model — do NOT modify or delete anything under src/test. Implement this task: ${task_text}
+          Write production code under src/main so the contract tests pass. Use a layered design (controller -> service), constructor injection, and SLF4J logging (a private static final Logger per class). Add pom.xml dependencies if needed. Run 'mvn -q -B test', fix every error, repeat until it passes. Do NOT run git. Finish only when 'mvn -q -B test' is green."
+          printf '%s' "$prompt" | claude -p --dangerously-skip-permissions --max-turns 80 > /tmp/implement.out 2>&1
+          rc=$?
+          tail -25 /tmp/implement.out
+          cd "$job_dir"
+          if [ "$rc" -ne 0 ]; then
+            echo "[run=${run_id}] stage=implement status=error claude_exit=${rc}"
+            echo "{\"stage\":\"implement\",\"status\":\"error\",\"claude_exit\":${rc},\"run_id\":\"${run_id}\"}" > result.json
+            exit "$rc"
+          fi
+          echo "[run=${run_id}] stage=implement status=ok"
+          echo "{\"stage\":\"implement\",\"model\":\"${ANTHROPIC_MODEL}\",\"run_id\":\"${run_id}\"}" > result.json
+      retry:
+        exponential:
+          attempts: 1
+          multiplier: 2
+          seconds: 30
+      timeout: 2700
+    - id: gate
+      summary: Build and test (mvn)
+      value:
+        type: rawscript
+        language: bash
+        input_transforms:
+          run_id:
+            type: javascript
+            expr: 'results.prepare.run_id'
+        content: |
+          set +e
+          run_id="${1:-unknown}"
+          job_dir="$(pwd)"
+          echo "[run=${run_id}] stage=gate start"
+          cd shared/repo
+          mvn -B -q clean test > /tmp/gate.log 2>&1
+          rc=$?
+          tail -40 /tmp/gate.log
+          cd "$job_dir"
+          if [ "$rc" = "0" ]; then verdict=pass; else verdict=fail; fi
+          echo "[run=${run_id}] stage=gate verdict=${verdict} mvn_exit=${rc}"
+          echo "{\"stage\":\"gate\",\"verdict\":\"${verdict}\",\"mvn_exit\":${rc},\"run_id\":\"${run_id}\"}" > result.json
+          exit 0
+      timeout: 2400
+    - id: gate_branch
+      summary: Branch on the gate verdict
+      value:
+        type: branchone
+        branches:
+          - summary: gate failed - stop
+            expr: 'results.gate.verdict != "pass"'
+            modules:
+              - id: gate_failed
+                summary: Gate failed
+                value:
+                  type: rawscript
+                  language: bash
+                  input_transforms: {}
+                  content: |
+                    echo "Gate failed - mvn test did not pass. Not delivering."
+                    echo '{"stage":"failed","reason":"gate"}' > result.json
+        default:
+          - id: review
+            summary: Cross-model review (reviewer role)
+            value:
+              type: rawscript
+              language: bash
+              input_transforms:
+                model_cfg:
+                  type: javascript
+                  expr: 'variable("u/admin/model_reviewer")'
+                task_text:
+                  type: javascript
+                  expr: 'flow_input.task_text'
+                run_id:
+                  type: javascript
+                  expr: 'results.prepare.run_id'
+              content: |
+                set -uo pipefail
+                model_cfg="$1"
+                task_text="$2"
+                run_id="${3:-unknown}"
+                job_dir="$(pwd)"
+                export ANTHROPIC_MODEL="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin)["model"])')"
+                akey="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin)["api_key"])')"
+                abase="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("base_url",""))')"
+                if [ -n "$abase" ]; then export ANTHROPIC_BASE_URL="$abase"; export ANTHROPIC_AUTH_TOKEN="$akey"; export ANTHROPIC_API_KEY=""; else export ANTHROPIC_API_KEY="$akey"; fi
+                export IS_SANDBOX=1
+                echo "[run=${run_id}] stage=review model=${ANTHROPIC_MODEL} start"
+                cd shared/repo
+                git add -A >/dev/null 2>&1
+                diff="$(git diff --cached -- src/main)"
+                prompt="You are the REVIEW stage — cross-model review. The production code below was written by a different, cheaper model. Review it against the task: ${task_text}
+                Check: conformance to the task, correctness, security, layered design, constructor injection, SLF4J logging, no test-gaming. Be concise. End with EXACTLY one final line: VERDICT: pass  OR  VERDICT: changes-requested
+                --- production code diff ---
+                ${diff}"
+                out="$(printf '%s' "$prompt" | claude -p --dangerously-skip-permissions --max-turns 40 2>&1)"
+                rc=$?
+                printf '%s\n' "$out" | tail -25
+                cd "$job_dir"
+                if [ "$rc" -ne 0 ]; then
+                  echo "[run=${run_id}] stage=review status=error claude_exit=${rc}"
+                  echo "{\"stage\":\"review\",\"status\":\"error\",\"claude_exit\":${rc},\"run_id\":\"${run_id}\"}" > result.json
+                  exit "$rc"
+                fi
+                v="$(printf '%s' "$out" | grep -oiE 'VERDICT:[[:space:]]*(pass|changes-requested)' | tail -1 | grep -oiE '(pass|changes-requested)' | tr 'A-Z' 'a-z')"
+                [ -z "$v" ] && v="pass"
+                printf '%s' "$out" > "$job_dir/shared/review.txt"
+                echo "[run=${run_id}] stage=review verdict=${v}"
+                echo "{\"stage\":\"review\",\"verdict\":\"${v}\",\"model\":\"${ANTHROPIC_MODEL}\",\"run_id\":\"${run_id}\"}" > result.json
+                exit 0
+            retry:
+              exponential:
+                attempts: 2
+                multiplier: 2
+                seconds: 20
+            timeout: 1200
+          - id: review_branch
+            summary: Rework if the review requested changes
+            value:
+              type: branchone
+              branches:
+                - summary: review requested changes - rework
+                  expr: 'results.review.verdict != "pass"'
+                  modules:
+                    - id: rework
+                      summary: Rework per review (coder role)
+                      value:
+                        type: rawscript
+                        language: bash
+                        input_transforms:
+                          model_cfg:
+                            type: javascript
+                            expr: 'variable("u/admin/model_coder")'
+                          run_id:
+                            type: javascript
+                            expr: 'results.prepare.run_id'
+                        content: |
+                          set -uo pipefail
+                          model_cfg="$1"
+                          run_id="${2:-unknown}"
+                          job_dir="$(pwd)"
+                          export ANTHROPIC_MODEL="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin)["model"])')"
+                          akey="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin)["api_key"])')"
+                          abase="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("base_url",""))')"
+                          if [ -n "$abase" ]; then export ANTHROPIC_BASE_URL="$abase"; export ANTHROPIC_AUTH_TOKEN="$akey"; export ANTHROPIC_API_KEY=""; else export ANTHROPIC_API_KEY="$akey"; fi
+                          export IS_SANDBOX=1
+                          echo "[run=${run_id}] stage=rework model=${ANTHROPIC_MODEL} start"
+                          cd shared/repo
+                          findings="$(cat ../review.txt 2>/dev/null || echo 'see review stage')"
+                          prompt="You are the IMPLEMENT stage, rework pass. A cross-model review of your production code returned changes-requested. Address the findings below. Do NOT modify src/test (the contract). Run 'mvn -q -B test' and keep it green. Do NOT run git.
+                          --- review findings ---
+                          ${findings}"
+                          printf '%s' "$prompt" | claude -p --dangerously-skip-permissions --max-turns 70 > /tmp/rework.out 2>&1
+                          rc=$?
+                          tail -20 /tmp/rework.out
+                          cd "$job_dir"
+                          if [ "$rc" -ne 0 ]; then
+                            echo "[run=${run_id}] stage=rework status=error claude_exit=${rc}"
+                            echo "{\"stage\":\"rework\",\"status\":\"error\",\"claude_exit\":${rc},\"run_id\":\"${run_id}\"}" > result.json
+                            exit "$rc"
+                          fi
+                          echo "[run=${run_id}] stage=rework status=done"
+                          echo "{\"stage\":\"rework\",\"status\":\"done\",\"run_id\":\"${run_id}\"}" > result.json
+                      retry:
+                        exponential:
+                          attempts: 1
+                          multiplier: 2
+                          seconds: 30
+                      timeout: 2400
+              default: []
+          - id: knowledge
+            summary: Update the knowledge base (memory-bank)
+            value:
+              type: rawscript
+              language: bash
+              input_transforms:
+                model_cfg:
+                  type: javascript
+                  expr: 'variable("u/admin/model_reviewer")'
+                task_text:
+                  type: javascript
+                  expr: 'flow_input.task_text'
+                run_id:
+                  type: javascript
+                  expr: 'results.prepare.run_id'
+              content: |
+                set -uo pipefail
+                model_cfg="$1"
+                task_text="$2"
+                run_id="${3:-unknown}"
+                job_dir="$(pwd)"
+                export ANTHROPIC_MODEL="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin)["model"])')"
+                akey="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin)["api_key"])')"
+                abase="$(printf '%s' "$model_cfg" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("base_url",""))')"
+                if [ -n "$abase" ]; then export ANTHROPIC_BASE_URL="$abase"; export ANTHROPIC_AUTH_TOKEN="$akey"; export ANTHROPIC_API_KEY=""; else export ANTHROPIC_API_KEY="$akey"; fi
+                export IS_SANDBOX=1
+                echo "[run=${run_id}] stage=knowledge model=${ANTHROPIC_MODEL} start"
+                cd shared/repo
+                prompt="You are the KNOWLEDGE stage of an automated delivery pipeline. The task below was just implemented and passed the gate. Update the project knowledge base so future runs do not start from scratch.
+                Task: ${task_text}
+                Do this: append a brief dated entry to memory-bank/current-state.md describing what was added; if a new component or module was introduced, note it in memory-bank/architecture.md; if a notable technical decision was made, add a short entry to memory-bank/decisions.md. Edit ONLY files under memory-bank/. Do NOT touch src/. Do NOT run git or mvn. Keep entries concise."
+                printf '%s' "$prompt" | claude -p --dangerously-skip-permissions --max-turns 30 > /tmp/knowledge.out 2>&1
+                rc=$?
+                tail -15 /tmp/knowledge.out
+                cd "$job_dir"
+                if [ "$rc" -ne 0 ]; then
+                  echo "[run=${run_id}] stage=knowledge status=error claude_exit=${rc} (non-blocking)"
+                  echo "{\"stage\":\"knowledge\",\"status\":\"error\",\"claude_exit\":${rc},\"run_id\":\"${run_id}\"}" > result.json
+                  exit 0
+                fi
+                echo "[run=${run_id}] stage=knowledge status=updated"
+                echo "{\"stage\":\"knowledge\",\"status\":\"updated\",\"run_id\":\"${run_id}\"}" > result.json
+            timeout: 900
+          - id: deliver
+            summary: Commit, push, open PR
+            value:
+              type: rawscript
+              language: bash
+              input_transforms:
+                github_token:
+                  type: javascript
+                  expr: 'variable("u/admin/github_token")'
+                branch:
+                  type: javascript
+                  expr: 'results.prepare.branch'
+                run_id:
+                  type: javascript
+                  expr: 'results.prepare.run_id'
+                review_verdict:
+                  type: javascript
+                  expr: 'results.review.verdict'
+              content: |
+                set -euo pipefail
+                github_token="$1"
+                branch="$2"
+                run_id="$3"
+                review_verdict="$4"
+                job_dir="$(pwd)"
+                echo "[run=${run_id}] stage=deliver start"
+                cd shared/repo
+                git add -A
+                git commit -m "feat: AI Delivery conductor run ${run_id}" -m "Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
+                git push -u origin "$branch"
+                payload="$(python3 -c 'import json,sys; print(json.dumps({"title":"AI Delivery conductor run "+sys.argv[1],"head":sys.argv[2],"base":"main","body":"Automated cross-model conductor run "+sys.argv[1]+".\n\ntest-design + review: reviewer role\nimplement: coder role\n\nCross-model review verdict: "+sys.argv[3]}))' "$run_id" "$branch" "$review_verdict")"
+                pr_json="$(curl -s -X POST "https://api.github.com/repos/Sekator778/registration-service/pulls" -H "Authorization: Bearer ${github_token}" -H "Accept: application/vnd.github+json" -d "$payload")"
+                cd "$job_dir"
+                pr_url="$(printf '%s' "$pr_json" | grep -oE 'https://github.com/[^"]+/pull/[0-9]+' | head -1)"
+                echo "[run=${run_id}] stage=deliver status=ok pr=${pr_url}"
+                echo "{\"stage\":\"deliver\",\"pr\":\"${pr_url}\",\"review\":\"${review_verdict}\",\"run_id\":\"${run_id}\"}" > result.json
+                exit 0
+            timeout: 600
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    task_text:
+      type: string
+      description: The business task for the conductor to implement
+  required: []

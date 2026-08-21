@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# ai-delivery-managed-hook — installed by scripts/install-git-hooks.sh.
+# Do not edit .git/hooks/pre-push directly; edit this file and re-run the
+# installer. Removing the marker line above makes the installer treat the
+# installed copy as hand-written and refuse to overwrite it.
+#
+# What this guards, as of 2026-08-20 (backlog/T06):
+#   1. Any remote — a secret-shaped string in added lines. Secrets belong in
+#      no repository, private included.
+#   2. The public mirror — a branch or tag push. Publishing goes through
+#      scripts/publish-public.sh, which pushes a bare commit SHA to
+#      refs/heads/main; that shape is allowed through, everything else is not.
+#
+# Personal paths and the operator's email are deliberately NOT checked on
+# `origin`: the private remote is allowed to carry them (CLAUDE.md §1). They
+# are checked on the mirror.
+#
+# This hook is a convenience layer, not a guarantee. It lives in .git/, which
+# no clone carries, so it may simply be absent. The real guards are the
+# disabled pushurl on public-mirror and the two-layer gate inside
+# scripts/publish-public.sh, which explicitly refuses to depend on this hook
+# (NFR-007). Never reason as if this hook is running.
+
+set -euo pipefail
+
+remote_name="$1"
+remote_url="${2:-}"
+
+zero_sha="0000000000000000000000000000000000000000"
+
+# --- Is this push aimed at the public mirror? -------------------------------
+# git passes the remote NAME when pushing to a configured remote, and the URL
+# in both $1 and $2 when pushing to a literal URL (which is exactly how
+# publish-public.sh --push-url does it). Match on both.
+mirror_url="$(git config --get remote.public-mirror.url 2>/dev/null || true)"
+targets_mirror=0
+if [[ "$remote_name" == "public-mirror" ]]; then
+    targets_mirror=1
+elif [[ -n "$mirror_url" && ( "$remote_url" == "$mirror_url" || "$remote_name" == "$mirror_url" ) ]]; then
+    targets_mirror=1
+elif [[ "$remote_url" == *"Sekator778/ai-delivery" || "$remote_url" == *"Sekator778/ai-delivery.git" ]]; then
+    targets_mirror=1
+fi
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [[ -z "${local_ref:-}" ]] && continue
+
+    # Scan the commits this push actually adds. `git log -p` takes a revision
+    # range, so both cases stay one shape. When the ref does not exist on the
+    # remote yet there is no remote_sha to subtract, so exclude everything
+    # already reachable from any remote-tracking branch instead of diffing the
+    # whole history (or, as this hook did before 2026-08-20, diffing the
+    # working tree against one commit and scanning almost nothing).
+    if [[ "$remote_sha" == "$zero_sha" || -z "${remote_sha:-}" ]]; then
+        range=("$local_sha" --not --remotes)
+        range_label="$local_sha (new ref, minus everything already pushed)"
+    else
+        range=("${remote_sha}..${local_sha}")
+        range_label="${remote_sha}..${local_sha}"
+    fi
+
+    # --- 1. Secret shapes — every remote ------------------------------------
+    if git log -p --no-merges "${range[@]}" 2>/dev/null \
+        | grep -qE '^\+.*(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{30,}|gho_[a-zA-Z0-9]{30,}|AIza[a-zA-Z0-9_-]{30,}|AKIA[A-Z0-9]{16})'; then
+        echo "BLOCKED: secret-shaped string in added lines of $range_label." >&2
+        echo "         Inspect: git log -p ${range[*]} | grep -E 'sk-|ghp_|gho_|AIza|AKIA'" >&2
+        exit 1
+    fi
+
+    [[ "$targets_mirror" -eq 1 ]] || continue
+
+    # --- 2. Public mirror — shape of the push -------------------------------
+    if [[ "$remote_ref" != "refs/heads/main" ]]; then
+        echo "BLOCKED: pushing $local_ref -> $remote_ref to the public mirror." >&2
+        echo "         The mirror has one branch: main." >&2
+        echo "         Publish with: scripts/publish-public.sh --ref dev" >&2
+        exit 1
+    fi
+
+    # publish-public.sh pushes a bare commit SHA, so local_ref is the SHA
+    # itself. A refs/heads/* or refs/tags/* source is a hand-rolled push of
+    # unfiltered, unscanned private history — the thing this hook exists for.
+    if [[ "$local_ref" == refs/heads/* || "$local_ref" == refs/tags/* ]]; then
+        echo "BLOCKED: $local_ref is a local branch or tag; it has not been" >&2
+        echo "         filtered or scanned. The mirror only ever receives a" >&2
+        echo "         commit built by scripts/publish-public.sh." >&2
+        echo "         Run: scripts/publish-public.sh --ref dev   (dry run first)" >&2
+        exit 1
+    fi
+
+    # --- 3. Public mirror — personal markers in added lines ------------------
+    # No literal markers here: this hook is itself published, so hardcoding
+    # the operator's paths/email would leak the very strings it guards.
+    # Markers are derived from the environment (home dir user, git email) and
+    # extended with the gitignored ops/publish-blocklist.local when present.
+    pat=""
+    home_user="$(basename "${HOME:-/nonexistent}")"
+    pat="/home/${home_user}|/Users/${home_user}"
+    cfg_email="$(git config user.email 2>/dev/null || true)"
+    [[ -n "$cfg_email" ]] && pat="${pat}|${cfg_email}"
+    blocklist="$(git rev-parse --show-toplevel 2>/dev/null)/ops/publish-blocklist.local"
+    if [[ -f "$blocklist" ]]; then
+        while IFS= read -r line; do
+            case "$line" in ''|\#*) continue ;; esac
+            pat="${pat}|${line}"
+        done < "$blocklist"
+    fi
+    if git log -p --no-merges "${range[@]}" 2>/dev/null \
+        | grep -qE "^\+.*(${pat})"; then
+        echo "BLOCKED: personal marker in added lines of $range_label." >&2
+        echo "         These are fine on origin, never on the public mirror." >&2
+        exit 1
+    fi
+done
+
+exit 0

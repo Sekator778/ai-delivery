@@ -1,0 +1,123 @@
+# Secrets — NEVER in git
+.secrets/
+.env
+.env.local
+.env.*.local
+**/.env
+!.env.example
+**/secrets/
+*.pem
+*.key
+*credentials*
+*.token
+
+# Agent logs and sessions
+*.log
+.sessions/
+
+# ops/atlas/aidstack.sh runtime state (pidfiles + rotated daemon logs)
+/.pids/
+/logs/
+
+# Python bytecode + caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs
+venv/
+.venv/
+env/
+.env/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+build/
+dist/
+worktrees/
+*.tar
+*.gz
+
+# Local stack data — NEVER commit. Volumes only.
+**/qdrant_storage/
+**/qdrant-data/
+**/fastembed_cache/
+**/ollama_data/
+**/ollama-data/
+**/whisper-models/
+**/silero-models/
+**/whisper-server/models/
+
+# Bot runtime state (NOT task state — tasks/*/state.json IS tracked)
+bot/state.json
+bot/media/
+
+# Async inbox for orchestrator <- meta messages (legacy, not in monorepo but safety)
+orchestrator-inbox/
+
+# Private Telegram chat export — do NOT publish (real people, voice messages, media)
+research/chat-export/
+research/sources/chat-export/
+
+# sample-monorepo — a separate git repository, do not nest it in this one
+sample-monorepo/
+
+# OS / temp
+*.tmp
+*.bak
+*~
+
+# Per-task runner PID + single-runner lock — process state, not history
+tasks/**/.runner.pid
+tasks/**/.runner.lock
+
+# Live task artifacts — runtime only, NEVER commit (they carry absolute host
+# paths + private target-repo references). Only the _TEMPLATE skeleton and each
+# bucket's .gitkeep are tracked. Without this, `git add -A` (e.g. during a public
+# sync) sweeps real task folders into a commit and leaks operator paths.
+#
+# The buckets are matched with `*`, not `*/`: a trailing slash matches
+# directories only, and loose files land in a bucket too — `<slug>.reason.txt`
+# is written straight into tasks/failed/ when a task is closed out, and a
+# failure reason routinely quotes a host path or a target repo. `_TEMPLATE/`
+# and README.md are deliberately not listed: they are the task-system skeleton
+# that scripts/publish-public.sh exports to the mirror.
+tasks/inbox/*
+tasks/active/*
+tasks/awaiting-input/*
+tasks/awaiting-approval/*
+tasks/done/*
+tasks/failed/*
+tasks/cancelled/*
+!tasks/*/.gitkeep
+
+# Scheduler lock — runtime state, not history
+.claude/scheduled_tasks.lock
+
+# Project registry — contains absolute host paths, per-deployment
+bot/projects.json
+
+# Operator's local PII/secret blocklist for publish-public.sh (gitignored by design)
+ops/publish-blocklist.local

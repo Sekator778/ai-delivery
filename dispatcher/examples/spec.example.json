@@ -1,0 +1,9 @@
+{
+  "trigger": "windmill",
+  "user": "operator",
+  "prompt": "Add a /health endpoint that returns {\"status\": \"ok\"} and a unit test covering it.",
+  "target_repo": "/absolute/path/to/your/target-repo",
+  "cost_cap_usd": 15,
+  "iteration_cap": 3,
+  "model_routing": { "developer": "anthropic" }
+}

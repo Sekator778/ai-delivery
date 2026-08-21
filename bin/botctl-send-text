@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# botctl-send-text — send a Telegram message from a meta-agent or sub-Claude.
+#
+# Behavior (2026-05-25 onwards):
+#   * Default parse_mode is HTML — the user wanted formatted replies after
+#     several plain-text responses showed literal `**word**` instead of bold.
+#   * A small Python preprocessor auto-converts common Markdown that
+#     meta-agents emit out of habit (`**bold**`, ``inline``, ```` ```fenced``` ````)
+#     into the equivalent HTML tags AFTER HTML-escaping &<>. Conversion order
+#     matters: fenced blocks first (their contents must NOT be re-escaped or
+#     re-converted), then inline code, then bold.
+#   * Telegram HTML supports: <b> <i> <u> <s> <code> <pre> <a> — nothing else.
+#     We only emit <b>, <i>, <code>, <pre> via conversion; everything else
+#     passes through as plain text (already HTML-escaped).
+#   * --no-html flag forces the old plain-text path for raw output (e.g.
+#     diffs, JSON dumps) where you do NOT want any conversion.
+#   * On HTML parse failure (Telegram 400 "can't parse entities"), the script
+#     auto-retries the same chunk as plain text so the user never gets a
+#     silent drop.
+#   * Long messages are chunked at 4000 chars (Telegram limit is 4096).
+set -euo pipefail
+source "$(dirname "$0")/botctl-common.sh"
+
+load_env
+require_cmd curl
+require_cmd jq
+require_cmd python3
+
+chat_id=$(target_chat_id)
+
+USE_HTML=1
+if [[ "${1:-}" == "--no-html" ]]; then
+  USE_HTML=0
+  shift
+fi
+
+text=""
+if [[ $# -ge 1 ]]; then
+  text="$1"
+else
+  text=$(cat)
+fi
+
+if [[ -z "$text" ]]; then
+  exit 0
+fi
+
+preprocess_html() {
+  # NB: cannot inline the Python via `python3 - <<'PY'` — `python3 -` reads
+  # its program from stdin, which consumes the heredoc and leaves
+  # `sys.stdin.read()` inside the script empty. The meta-agent caught this
+  # bug in production 2026-05-25 (HTML replies came out blank). Keeping the
+  # preprocessor in a sibling file makes the data path explicit:
+  #     upstream pipe → python3 script → stdout
+  python3 "$(dirname "$0")/_preprocess-html.py"
+}
+
+while [[ -n "$text" ]]; do
+  chunk="${text:0:4000}"
+  text="${text:4000}"
+
+  if [[ $USE_HTML -eq 1 ]]; then
+    payload=$(printf '%s' "$chunk" | preprocess_html)
+    response=$(tg_api sendMessage \
+      -d "chat_id=${chat_id}" \
+      -d "parse_mode=HTML" \
+      --data-urlencode "text=${payload}" \
+      -w "\n%{http_code}")
+  else
+    response=$(tg_api sendMessage \
+      -d "chat_id=${chat_id}" \
+      --data-urlencode "text=${chunk}" \
+      -w "\n%{http_code}")
+  fi
+
+  http_code=$(echo "$response" | tail -1)
+  body=$(echo "$response" | sed '$d')
+
+  if [[ "$http_code" != 2* ]]; then
+    echo "botctl-send-text: HTTP $http_code from sendMessage" >&2
+    echo "$body" >&2
+    if [[ $USE_HTML -eq 1 ]] && echo "$body" | grep -q "can't parse entities"; then
+      echo "botctl-send-text: retrying as plain text" >&2
+      response=$(tg_api sendMessage \
+        -d "chat_id=${chat_id}" \
+        --data-urlencode "text=${chunk}" \
+        -w "\n%{http_code}")
+      http_code=$(echo "$response" | tail -1)
+      if [[ "$http_code" != 2* ]]; then
+        exit 1
+      fi
+    else
+      exit 1
+    fi
+  fi
+done

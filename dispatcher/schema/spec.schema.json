@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Sekator778/ai-delivery/dispatcher/schema/spec.schema.json",
+  "title": "Task spec",
+  "description": "Input contract for tasks/inbox/<task-id>/spec.json. Written by bot.py (Telegram trigger), by windmill/flows/pipeline-trigger.yaml (cron trigger), or dropped directly by an operator or script (manual/scripted trigger). Consumed by task-dispatcher daemon, which moves the folder to tasks/active/ and writes state.json + task.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["trigger", "user", "prompt", "target_repo"],
+  "properties": {
+    "trigger": {
+      "description": "Where the task originated. 'telegram' = submitted via the Telegram bot (requires telegram_thread). 'windmill' = submitted by a Windmill cron flow (telegram_thread optional). 'manual' = dropped directly into tasks/inbox/ by an operator or script (telegram_thread optional; supply it to opt into status threading).",
+      "enum": ["telegram", "windmill", "manual"]
+    },
+    "user": {
+      "description": "Telegram username (e.g. 'your-telegram-handle') or 'windmill-cron'. Used for routing approval prompts back to the right Telegram thread.",
+      "type": "string",
+      "minLength": 1
+    },
+    "prompt": {
+      "description": "Free-text task description from the user. The BA stage consumes this verbatim.",
+      "type": "string",
+      "minLength": 1
+    },
+    "target_repo": {
+      "description": "Absolute filesystem path to the target repo working tree (e.g. '/home/<user>/projects/<target-repo>') OR a git remote URL the dispatcher will clone into a worktree.",
+      "type": "string",
+      "minLength": 1
+    },
+    "schedule": {
+      "description": "Optional cron expression if this task originated from a Windmill schedule. Echoed into state.json for audit; the dispatcher does not parse it.",
+      "type": ["string", "null"]
+    },
+    "task_id": {
+      "description": "Optional. If omitted, the dispatcher allocates 'TASK-<N>' where N is the next sequential id. If supplied, must match TASK-<digits> or a kebab-case slug.",
+      "type": "string",
+      "pattern": "^(TASK-[0-9]+|[a-z0-9][a-z0-9-]{0,62})$"
+    },
+    "created_at": {
+      "description": "ISO-8601 timestamp the spec was written. The dispatcher fills this if absent.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "cost_cap_usd": {
+      "description": "Hard ceiling on total API spend for this task. When exceeded, the dispatcher stops the auto-loop, moves the folder to awaiting-input/, and asks the user via Telegram whether to continue.",
+      "type": "number",
+      "minimum": 0,
+      "default": 20
+    },
+    "iteration_cap": {
+      "description": "Max number of Dev->Test->Sec->Reviewer iterations before escalation. Combined with cost_cap_usd as the watchdog upper bound.",
+      "type": "integer",
+      "minimum": 1,
+      "default": 3
+    },
+    "model_routing": {
+      "description": "Per-stage backend selection. Defaults follow PHASE-5-DESIGN §3: BA and Architect on Opus (anthropic), the rest on DeepSeek. GLM-5.1 (z.ai) is available as third fallback; the rate-limit recovery menu in bot.py exposes switch buttons across all three. Override per-task if the prompt warrants a different mix.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "discovery": {"enum": ["anthropic", "deepseek", "glm"], "default": "anthropic"},
+        "ba": {"enum": ["anthropic", "deepseek", "glm"], "default": "anthropic"},
+        "architect": {"enum": ["anthropic", "deepseek", "glm"], "default": "anthropic"},
+        "developer": {"enum": ["anthropic", "deepseek", "glm"], "default": "deepseek"},
+        "tester": {"enum": ["anthropic", "deepseek", "glm"], "default": "deepseek"},
+        "security": {"enum": ["anthropic", "deepseek", "glm"], "default": "deepseek"},
+        "reviewer": {"enum": ["anthropic", "deepseek", "glm"], "default": "deepseek"}
+      }
+    },
+    "telegram_thread": {
+      "description": "Telegram chat id + message id of the original request. Used to thread status updates back to the right conversation. Required when trigger=telegram (conditional enforced by allOf/if/then below). Optional for trigger=windmill and trigger=manual — supply it to opt into status threading; omit or set null to skip Telegram notifications for this task.",
+      "type": ["object", "null"],
+      "properties": {
+        "chat_id": {"type": ["integer", "string"]},
+        "message_id": {"type": "integer"}
+      },
+      "required": ["chat_id", "message_id"]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"trigger": {"const": "telegram"}}},
+      "then": {"required": ["telegram_thread"]}
+    }
+  ]
+}

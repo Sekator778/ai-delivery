@@ -1,0 +1,2 @@
+# Real keys live in .env locally; only .env.example goes to git.
+.env

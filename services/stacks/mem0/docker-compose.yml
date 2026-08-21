@@ -1,0 +1,18 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.13.0
+    container_name: claude-tg-qdrant
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - ./qdrant-data:/qdrant/storage
+    restart: unless-stopped
+    # qdrant/actix opens many fds; Docker's default 1024 soft nofile limit makes
+    # it panic with "Too many open files" and crash-loop. Raise the soft limit.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 1048576
+    # No healthcheck: qdrant image ships without curl/wget/nc, and qdrant has no
+    # built-in CMD for liveness probes. Verify externally via
+    # `curl http://127.0.0.1:6333/` from the host (see README.md).

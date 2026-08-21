@@ -1,0 +1,47 @@
+# AI Delivery — task intake poller.
+#
+# Scheduled every minute. Polls /intake/inbox (the host folder ai-delivery/intake/inbox
+# bind-mounted into the worker) for *.md task files. For each one it starts the
+# `pipeline_real` conductor flow with the file content as the task, then moves the
+# file into processed/ so it is not run again.
+#
+# Deploy:  wmill flow push windmill/flows/intake-poll.flow f/ai_delivery/intake_poll \
+#            --workspace ai-delivery --base-url http://localhost/ --token <TOKEN>
+summary: AI Delivery - task intake poller
+description: >-
+  Polls intake/inbox for task files, starts the conductor pipeline for each, and
+  moves the file to processed/. Scheduled every minute.
+value:
+  same_worker: false
+  modules:
+    - id: poll
+      summary: Poll inbox and trigger the pipeline
+      value:
+        type: rawscript
+        language: bash
+        input_transforms: {}
+        content: |
+          set +e
+          inbox=/intake/inbox
+          mkdir -p "$inbox/processed"
+          triggered=0
+          for f in "$inbox"/*.md; do
+            [ -e "$f" ] || continue
+            name="$(basename "$f")"
+            [ "$name" = "README.md" ] && continue
+            # Build the JSON payload safely (the task file may contain quotes/newlines).
+            payload="$(python3 -c 'import json,sys; print(json.dumps({"task_text": sys.stdin.read()}))' < "$f")"
+            job="$(curl -s -X POST "http://windmill_server:8000/api/w/ai-delivery/jobs/run/f/f/ai_delivery/pipeline_real" \
+              -H "Authorization: Bearer $WM_TOKEN" -H 'Content-Type: application/json' -d "$payload")"
+            mv "$f" "$inbox/processed/$(date +%Y%m%d-%H%M%S)-$name"
+            triggered=$((triggered + 1))
+            echo "intake: $name -> pipeline_real job $job"
+          done
+          [ "$triggered" = 0 ] && echo "intake: no new task files"
+          echo "{\"triggered\":${triggered}}" > result.json
+          exit 0
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties: {}
+  required: []

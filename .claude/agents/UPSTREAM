@@ -1,0 +1,109 @@
+# .claude/agents — upstream provenance and sync policy
+#
+# Same contract as .claude/templates/*/UPSTREAM: this file is the single
+# source of truth for where each persona came from, and it is kept in sync
+# with the AGENTS_* mappings in ops/refresh-vendored-templates.sh. Update
+# both together — the drift check walks the script's mapping, and this file
+# is what a human reads to understand it.
+#
+# Run the drift check with:
+#   ops/refresh-vendored-templates.sh
+# It never writes into the tree; it prints a report path for an operator to
+# review and port by hand.
+
+## Sources
+
+VoltAgent/awesome-claude-code-subagents  https://github.com/VoltAgent/awesome-claude-code-subagents
+wshobson/agents                          https://github.com/wshobson/agents
+BMAD-METHOD (v6.11.0, MIT)               https://github.com/bmad-code-org/BMAD-METHOD
+
+## Sync classes
+
+The set is deliberately small: every file here is dispatched by name at
+runtime, or is this README. Nothing is kept "in case it is useful later" —
+that is what produced a 22-file catalogue where 11 were dead (2026-08-15).
+
+- VENDORED — taken from upstream near-verbatim; only the frontmatter tool
+  restrictions are patched to this repo's role-class discipline. These are
+  diffed against upstream by the refresh script; a material upstream change
+  should usually be ported.
+
+- ADAPTED — the body was rewritten for this pipeline. The upstream diff is
+  INFORMATIONAL only: never bulk-apply it, or the adaptation is lost. Read it
+  to notice new upstream ideas worth re-adapting.
+
+- OURS — no upstream. Not diffed.
+
+## Mapping (local | upstream path within its repo)
+
+### VENDORED — VoltAgent/awesome-claude-code-subagents
+
+  backend-developer.md  | categories/01-core-development/backend-developer.md
+  test-automator.md     | categories/04-quality-security/test-automator.md
+  security-auditor.md   | categories/04-quality-security/security-auditor.md
+
+  Local patches (each carries an HTML comment near its frontmatter):
+  - ALL THREE (2026-08-15, second pass) — upstream's dead inter-agent
+    machinery removed: the "Query context manager" step (context-manager is
+    the Discovery stage's own persona here, not a service a stage can
+    query), the requesting_agent JSON protocol blocks, the canned delivery
+    notifications with fabricated statistics (an open invitation to invent
+    results), and the "Integration with other agents" lists naming agents
+    that do not exist in this roster. Replaced with target-repo-conventions
+    openings and honest-reporting instructions. A re-vendor from upstream
+    would restore all of it — port upstream changes by hand.
+  - backend-developer.md — additionally, upstream's "deep expertise in
+    Node.js 18+, Python 3.11+, and Go 1.21+" opening removed (first pass).
+    A persona dispatched for arbitrary target repos cannot carry a language
+    list; the language comes from the target's own CLAUDE.md / AGENTS.md.
+  - security-auditor.md — tools restricted to Read, Grep, Glob (read-only
+    auditor; upstream ships write access).
+
+### VENDORED — wshobson/agents
+
+  team-lead.md          | plugins/agent-teams/agents/team-lead.md
+  team-reviewer.md      | plugins/agent-teams/agents/team-reviewer.md
+  team-debugger.md      | plugins/agent-teams/agents/team-debugger.md
+  team-implementer.md   | plugins/agent-teams/agents/team-implementer.md
+
+  These four are NOT used by the pipeline. They back the .claude/commands/
+  team-* slash commands (interactive fan-out). Kept for that consumer only —
+  if those commands go, these go with them.
+
+### ADAPTED — do not bulk-apply the diff
+
+  architect.md          | VoltAgent categories/01-core-development/microservices-architect.md
+      Renamed to match the pipeline stage name; description rewritten for the
+      ai-delivery context. 55 lines against upstream's 238 — the trimming IS
+      the adaptation.
+
+  business-analyst.md   | VoltAgent categories/08-business-product/business-analyst.md
+      56 lines against upstream's ~290. Classified VENDORED at first and
+      corrected by the first drift run (2026-08-15) — 275 of the differing
+      lines exist only upstream, i.e. the body was replaced, not patched.
+
+  context-manager.md    | VoltAgent categories/09-meta-orchestration/context-manager.md
+      Same correction: 131 of the differing lines exist only on our side.
+
+  code-reviewer.md      | VoltAgent categories/04-quality-security/code-reviewer.md
+      Body fully replaced (#21). Upstream's generic checklist ("code coverage
+      > 80% confirmed", "cyclomatic complexity < 10 maintained") carried no
+      methodology and no evidence discipline — the weakest link in the
+      pipeline per research/bmad-steal-list.md §1. Tools stripped to
+      Read, Grep, Glob so the reviewer is physically unable to patch.
+
+  blind-hunter.md       | BMAD v6.11.0 — no 1:1 upstream file
+  edge-case-hunter.md   | BMAD v6.11.0 ship/bmad-code-review/review-prompts/edge-case-hunter.md
+  verification-gap.md   | BMAD v6.11.0 ship/bmad-code-review/review-prompts/verification-gap.md
+      Adapted, not vendored: native agent definitions instead of
+      {skill-root} instruction files resolved by the _bmad/ runtime,
+      read-only tools in frontmatter, every interactive halt stripped (they
+      run unattended under `claude -p`), one shared findings block instead of
+      three output dialects, severity emitted as an explicitly labelled
+      proposal. The BMAD-side sources are already diffed through the
+      .claude/templates/bmad-v6/ mapping — not duplicated here.
+
+### OURS — no upstream
+
+  pattern-detector.md   — written for this pipeline's pattern-detection stage.
+  README.md             — our own documentation, not vendored content.

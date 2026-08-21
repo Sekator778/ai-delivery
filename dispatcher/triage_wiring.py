@@ -1,0 +1,190 @@
+"""Adaptive-complexity triage primitives — classification, reporting, persistence.
+
+Extracted from stage_runner_agent.py (god-module split, 2026-06-04). The reusable
+building blocks of the triage layer (committee RFC: size the pipeline to the task
+instead of running the max pipeline on every task — the $16.95-for-a-10-line-
+function pathology): mode / act gating (_triage_mode, _triage_acting), the one
+cheap-model verdict call (_triage_run_claude), the audit report + lite-BRD
+writers, the durable sticky-verdict persistence (_persist_triage /
+_load_persisted_triage), and the reviewer "what NOT to flag" hint clauses
+(_REVIEWER_S_HINT / _REVIEWER_M_HINT).
+
+The run-loop glue that invokes these — _maybe_run_triage, _maybe_upgrade_tier and
+_reviewer_triage_hint — stays in the orchestrator: the first two depend on the
+pipeline stage-list builder, and all three are monkeypatched-through by the test
+suite via stage_runner_agent.*, so they must resolve their collaborators in that
+namespace.
+
+Depends on backend_routing for the triage LLM's subprocess env; else stdlib.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from backend_routing import _subagent_env
+
+
+def _triage_mode() -> str:
+    # Default is `shadow` (ai-delivery-private#2, 2026-08): unset/empty/invalid
+    # TRIAGE_MODE now at least classifies + logs + writes state.triage, running
+    # the full pipeline unchanged (see _triage_acting — shadow never acts). An
+    # explicit TRIAGE_MODE=off still opts back into the old no-op behaviour;
+    # TRIAGE_DISABLED=1 remains the unconditional kill switch.
+    if os.environ.get("TRIAGE_DISABLED", "").strip() == "1":
+        return "off"
+    mode = os.environ.get("TRIAGE_MODE", "shadow").strip().lower() or "shadow"
+    return mode if mode in ("off", "shadow", "s-only", "full") else "shadow"
+
+
+def _triage_acting(mode: str, tier: str | None) -> bool:
+    """True when triage should ACT on this task (size pipeline + caps) rather
+    than merely observe. s-only acts on S; full acts on S and M; L is the full
+    pipeline either way so 'acting' on L is a no-op narrowing."""
+    if mode == "s-only":
+        return tier == "S"
+    if mode == "full":
+        return tier in ("S", "M", "L")
+    return False
+
+
+def _triage_run_claude(prompt: str) -> str:
+    """Injected LLM runner for the triage verdict — ONE cheap-model call.
+    Best-effort: a non-zero rc or timeout just yields empty output so triage
+    degrades to deterministic-only classification."""
+    # Two-model policy (2026-06-07): the triage verdict is a cheap classify — run
+    # it on anthropic-Sonnet (stage "triage" is not in OPUS_STAGES), not DeepSeek.
+    backend = os.environ.get("TRIAGE_LLM_BACKEND", "anthropic").strip() or "anthropic"
+    env = _subagent_env(backend, "triage")
+    try:
+        proc = subprocess.run(
+            ["claude", "--dangerously-skip-permissions", "-p", prompt],
+            capture_output=True, text=True, timeout=120, env=env,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        print(f"warn: triage LLM call failed: {exc}", file=sys.stderr)
+        return ""
+    if proc.returncode != 0:
+        print(f"warn: triage LLM rc={proc.returncode}", file=sys.stderr)
+        return ""
+    return proc.stdout or ""
+
+
+def _write_triage_report(task_dir: Path, tri, mode: str) -> None:
+    """Audit-trail report next to the canonical artifacts (00a-triage.md)."""
+    d = tri.dimensions
+    lines = [
+        "# Triage report",
+        "",
+        f"**Mode**: `{mode}`    **Tier**: **{tri.tier}**    "
+        f"**Source**: {tri.source}    **Confidence**: {tri.confidence:.2f}",
+        "",
+        "## Dimensions",
+        "",
+        f"- type: `{d.get('type')}`",
+        f"- size: `{d.get('size')}`",
+        f"- risk: `{d.get('risk')}`",
+        f"- clarity: `{d.get('clarity')}`",
+        "",
+        "## Caps (this tier — budget in tokens, not $)",
+        "",
+        f"- iteration_cap: {tri.caps.get('iteration_cap')}",
+        f"- token_cap: {tri.caps.get('token_cap')}",
+        "",
+        "## Reasons",
+        "",
+    ]
+    lines += [f"- {r}" for r in tri.reasons]
+    (task_dir / "00a-triage.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_lite_brd(task_dir: Path, spec: dict) -> None:
+    """S-tier skips the (expensive Opus) BA stage; write a minimal BRD from the
+    task text so the downstream BRD guard passes and developer/tester/security/
+    reviewer have a spec to anchor on. Deterministic — the saving is skipping
+    the BA *stage*, not the spec text. No-op if a real BA artifact already
+    exists (resume safety)."""
+    if (task_dir / "01-ba.md").exists():
+        return
+    prompt = str(spec.get("prompt") or "").strip()
+    brd = (
+        "# BRD (lite — triage S-tier, BA stage skipped)\n\n"
+        "> Auto-generated by the triage layer for a trivial task. The full BA\n"
+        "> stage was skipped to size effort to the task; this captures the\n"
+        "> request verbatim so downstream stages have a spec to anchor on.\n"
+        "> IMPLEMENTER NOTE: no discovery / architecture / tasks / edge-case\n"
+        "> artifacts exist for this tier by design — implement directly from\n"
+        "> FR-001; do not block or wait on those files.\n\n"
+        "## Functional Requirements\n\n"
+        f"- FR-001 — {prompt}\n\n"
+        "## Acceptance Criteria\n\n"
+        "- AC-001 — The change implements exactly the request above, with tests, "
+        "and introduces no regressions.\n"
+    )
+    for name in ("01-ba.md", "01-ba-agent.md"):
+        (task_dir / name).write_text(brd, encoding="utf-8")
+
+
+_TRIAGE_VERDICT_FILE = "triage.json"
+
+
+def _persist_triage(task_dir: Path, verdict: dict) -> None:
+    """Persist the triage verdict to a durable per-task file so it survives the
+    fresh state.json the dispatcher writes on every (re-)ingest. Best-effort."""
+    try:
+        (task_dir / _TRIAGE_VERDICT_FILE).write_text(
+            json.dumps(verdict, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _load_persisted_triage(task_dir: Path) -> dict | None:
+    """A previously-persisted triage verdict for this task, or None. Backs the
+    STICKY-triage rule: a task already classified must not be re-classified on a
+    re-ingest (clarify round-trip / crash recovery). Re-running is
+    non-deterministic — the best-effort LLM verdict can flake on the second pass,
+    leaving the deterministic-only conf 0.50 which trips the <0.70 fail-safe and
+    silently downgrades the tier (observed 2026-06-02: M→L after a clarify
+    pause). The task is unchanged across the round-trip, so the first verdict
+    stands. Returns None on a missing/malformed file (→ classify fresh)."""
+    p = task_dir / _TRIAGE_VERDICT_FILE
+    if not p.is_file():
+        return None
+    try:
+        v = json.loads(p.read_text())
+    except Exception:
+        return None
+    return v if isinstance(v, dict) and v.get("tier") and v.get("caps") else None
+
+
+# RFC §Q3: scale reviewer rigor DOWN for trivial tasks (Cloudflare's "what NOT
+# to flag") — the mechanism that stops the trivial-task nitpick hotfix loop
+# (the $16.95 pathology) inside a single review pass.
+_REVIEWER_S_HINT = (
+    "\nTRIAGE — this change is classified TRIVIAL (tier S). Apply \"what NOT to "
+    "flag\":\n"
+    "- Flag ONLY genuine merge-blockers (real correctness bugs, security issues, "
+    "or BRD violations) as Critical.\n"
+    "- Record stylistic / theoretical / polish / \"could be more robust\" "
+    "concerns as Suggestions — NEVER Critical or Warning.\n"
+    "- If there are zero genuine merge-blockers, return `approve` with "
+    "CRITICAL: 0. Do not invent issues to justify a review on a small, low-risk "
+    "change.\n"
+)
+
+
+_REVIEWER_M_HINT = (
+    "\nTRIAGE — this change is tier M (medium, low-risk). Reserve **Critical** "
+    "for GENUINE merge-blockers:\n"
+    "- Critical = a real correctness / security / data-loss bug in the SHIPPED "
+    "code, or a direct BRD violation. Nothing else.\n"
+    "- Test-quality concerns (duplication / DRY, fixture style, naming, "
+    "\"could be more robust\") and theoretical / polish issues → Warning or "
+    "Suggestion, NEVER Critical.\n"
+    "- Do NOT re-flag the same class of issue across iterations to force "
+    "request_changes; once the genuine merge-blockers are resolved, return "
+    "`approve`.\n"
+)

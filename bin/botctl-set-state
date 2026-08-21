@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/botctl-common.sh"
+
+if [[ $# -ne 2 ]]; then
+  echo "Usage: $0 <jq_path> <value>" >&2
+  exit 2
+fi
+
+jq_path="$1"
+raw_value="$2"
+
+if [[ "$raw_value" =~ ^(\"|\[|\{) ]] || [[ "$raw_value" =~ ^(true|false|null|-?[0-9]+(\.[0-9]+)?)$ ]]; then
+  json_value="$raw_value"
+else
+  json_value="\"$raw_value\""
+fi
+
+if [[ -f "$STATE_FILE" ]]; then
+  current=$(jq -r '.' "$STATE_FILE")
+else
+  current="{}"
+fi
+
+updated=$(jq -c --arg path "$jq_path" --argjson val "$json_value" '
+  setpath(($path | split(".")); $val)
+' <<<"$current")
+
+tmpfile="${STATE_FILE}.tmp"
+echo "$updated" > "$tmpfile"
+mv "$tmpfile" "$STATE_FILE"
+echo "$updated"

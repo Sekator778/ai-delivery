@@ -1,0 +1,6 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+torch==2.4.1
+numpy==1.26.4
+soundfile==0.12.1
+omegaconf==2.3.0

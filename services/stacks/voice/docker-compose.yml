@@ -1,0 +1,48 @@
+# Voice stack: Whisper STT (:8765) + Silero TTS (:8768).
+# Both bound to 127.0.0.1 only — bot.py reaches them via localhost.
+# Models live in host-mounted volumes so the images stay small and the
+# operator can swap models without rebuilding.
+
+services:
+  whisper:
+    build:
+      context: ./whisper-server
+    container_name: claude-tg-whisper
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      # Mount the local models/ dir into /models/ inside the container.
+      # The whisper-cli binary reads WHISPER_MODEL_PATH (default
+      # /models/ggml-medium.bin). Operator downloads the .bin file once
+      # via download-models.sh; subsequent restarts reuse it.
+      - ./whisper-server/models:/models:ro
+    environment:
+      WHISPER_MODEL_PATH: /models/ggml-medium.bin
+      WHISPER_BIN: whisper-cli
+      HOST: 0.0.0.0
+      PORT: "8765"
+      # Configurable processing timeouts — forwarded from bot/.env (FR-014/FR-015).
+      # Set these to the same values as in bot/.env to keep client and server in sync.
+      WHISPER_TIMEOUT_SEC: ${WHISPER_TIMEOUT_SEC:-600}
+      FFMPEG_TIMEOUT_SEC: ${FFMPEG_TIMEOUT_SEC:-60}
+    restart: unless-stopped
+
+  silero:
+    build:
+      context: ./silero-server
+    container_name: claude-tg-silero
+    ports:
+      - "127.0.0.1:8768:8768"
+    volumes:
+      # Persist torch.hub cache across container recreations so the
+      # Silero v4_ru model isn't re-downloaded on every restart.
+      - silero-cache:/root/.cache/torch
+    environment:
+      SILERO_LANGUAGE: ru
+      SILERO_MODEL_ID: v4_ru
+      HOST: 0.0.0.0
+      PORT: "8768"
+    restart: unless-stopped
+
+volumes:
+  silero-cache:

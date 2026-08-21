@@ -1,0 +1,50 @@
+# AI Delivery — ops healthcheck (the ops/self-healing layer, layer 2).
+#
+# A scheduled probe of the conductor's dependencies. It reports status and emits an
+# ALERT line on problems. Container-level self-healing (restart of crashed/unhealthy
+# containers) is done by `restart: unless-stopped` + the `autoheal` watchdog — see
+# ops/self-healing.md. This flow is the application-level monitoring on top.
+#
+# Deploy:  wmill flow push windmill/flows/ops-healthcheck.flow f/ai_delivery/ops_healthcheck \
+#            --workspace ai-delivery --base-url http://localhost/ --token <TOKEN>
+summary: AI Delivery - ops healthcheck
+description: >-
+  Scheduled health probe of the conductor's dependencies (Windmill API, GitHub,
+  Anthropic). Reports status, alerts on problems.
+value:
+  same_worker: false
+  modules:
+    - id: healthcheck
+      summary: Probe dependencies
+      value:
+        type: rawscript
+        language: bash
+        input_transforms: {}
+        content: |
+          set +e
+          ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          problems=""
+
+          # Windmill server API (internal compose network)
+          wm=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://windmill_server:8000/api/version)
+          [ "$wm" = "200" ] || problems="$problems windmill_api(http=$wm)"
+
+          # GitHub API reachability
+          gh=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://api.github.com)
+          [ "$gh" = "200" ] || problems="$problems github_api(http=$gh)"
+
+          # Anthropic API reachability — an unauthenticated call returns 400/401,
+          # which still means the endpoint is reachable; 000/empty means unreachable.
+          an=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://api.anthropic.com/v1/messages)
+          case "$an" in 000|"") problems="$problems anthropic_api(unreachable)";; esac
+
+          if [ -z "$problems" ]; then status=healthy; else status=degraded; fi
+          echo "[ops_healthcheck] $ts status=$status problems=[${problems# }]"
+          [ "$status" = healthy ] || echo "ALERT: AI Delivery dependencies degraded - [${problems# }]"
+          echo "{\"ts\":\"$ts\",\"status\":\"$status\",\"problems\":\"${problems# }\"}" > result.json
+          exit 0
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties: {}
+  required: []

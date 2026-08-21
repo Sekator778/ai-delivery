@@ -1,0 +1,32 @@
+[Unit]
+Description=AI Delivery — pipeline crash-recovery watcher
+After=network-online.target ai-delivery-windmill.service claude-tg-bot.service
+Wants=network-online.target
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=<USER>
+Group=<USER>
+WorkingDirectory=<REPO_ROOT>
+ExecStart=/usr/bin/python3 dispatcher/watcher.py
+Environment=PYTHONUNBUFFERED=1
+Environment=WATCHER_POLL_INTERVAL=15
+Environment=WATCHER_MAX_RESPAWN=3
+Environment=WATCHER_MIN_ARTIFACT_SIZE=50
+Environment=WATCHER_GRACE_PERIOD=30
+Environment=WATCHER_LOG_LEVEL=INFO
+# Same env as the dispatcher: a respawned runner needs STAGE_RUNNER_MODE,
+# DEEPSEEK_API_KEY and the feature flags, or it switches runner/backend
+# mid-task. The watcher also reads this file directly as a fallback.
+EnvironmentFile=-<HOME>/claude-telegram-bot/.env
+
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=watcher
+
+[Install]
+WantedBy=multi-user.target

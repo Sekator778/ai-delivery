@@ -1,0 +1,19 @@
+# Installed by ops/install-docker-prune-timer.sh (placeholders substituted at install time).
+# Triggered by docker-prune.timer — do not enable directly.
+[Unit]
+Description=AI Delivery — safe weekly Docker prune (dangling images + build cache only)
+Documentation=file://<REPO_ROOT>/scripts/docker-prune.sh
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+User=<USER>
+Group=<USER>
+WorkingDirectory=<REPO_ROOT>
+ExecStart=<REPO_ROOT>/scripts/docker-prune.sh
+# A weekly prune on a busy build host can take a few minutes; give it room.
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=docker-prune

@@ -1,0 +1,164 @@
+# Конвейер AI Delivery — OpenFlow-флоу для Windmill (дирижёр 4.2).
+#
+# Стадии — inline bash rawscript в STUB-режиме: возвращают заготовленный артефакт
+# (в ./result.json) вместо вызова `claude`. Реальный харнес-вызов подключается на
+# пилоте (Max-подписка) в месте, помеченном "РЕАЛЬНЫЙ режим" в каждой стадии.
+#
+# Деплой:  wmill flow push windmill/flows/ai-delivery-pipeline.flow \
+#            f/ai_delivery/pipeline --workspace ai-delivery --base-url http://localhost/ --token <TOKEN>
+#
+# Конвенции Windmill, учтённые после первого прогона:
+#  - каждый параметр bash — на ОТДЕЛЬНОЙ строке (X="$N"), иначе не парсится;
+#  - результат стадии писать в ./result.json — тогда это объект, и ветки читают
+#    results.<id>.<field>; echo в stdout даёт строку, доступ к полю не работает.
+summary: AI Delivery — конвейер доставки
+description: >-
+  Дирижёр конвейера: triage -> spec -> plan -> test_design -> implement -> gate,
+  далее ветка по вердикту гейта (fail -> доработка; pass -> ручной аппрув -> prod).
+  STUB-режим — проверка плюмбинга дирижёра без ключей.
+value:
+  same_worker: false
+  modules:
+    - id: triage
+      summary: Триаж задачи
+      value:
+        type: rawscript
+        language: bash
+        input_transforms:
+          task_id: { type: javascript, expr: flow_input.task_id }
+          mode: { type: javascript, expr: flow_input.mode }
+        content: |
+          task_id="$1"
+          mode="${2:-stub}"
+          >&2 echo "[triage] task=$task_id mode=$mode"
+          # РЕАЛЬНЫЙ режим: claude -p со скиллом skills/spec (быстрый вердикт)
+          echo '{"stage":"triage","verdict":"ok","estimate":"S"}' > result.json
+    - id: spec
+      summary: Спецификация
+      value:
+        type: rawscript
+        language: bash
+        input_transforms:
+          task_id: { type: javascript, expr: flow_input.task_id }
+          mode: { type: javascript, expr: flow_input.mode }
+        content: |
+          task_id="$1"
+          mode="${2:-stub}"
+          >&2 echo "[spec] task=$task_id mode=$mode"
+          # РЕАЛЬНЫЙ режим: claude -p со скиллом skills/spec (модель: Opus)
+          echo '{"stage":"spec","artifact":"spec.md","status":"done"}' > result.json
+    - id: plan
+      summary: План реализации
+      value:
+        type: rawscript
+        language: bash
+        input_transforms:
+          task_id: { type: javascript, expr: flow_input.task_id }
+          mode: { type: javascript, expr: flow_input.mode }
+        content: |
+          task_id="$1"
+          mode="${2:-stub}"
+          >&2 echo "[plan] task=$task_id mode=$mode"
+          # РЕАЛЬНЫЙ режим: claude -p со скиллом skills/plan, plan mode (модель: Opus)
+          echo '{"stage":"plan","artifact":"plan.md","status":"done"}' > result.json
+    - id: test_design
+      summary: Тесты-контракт
+      value:
+        type: rawscript
+        language: bash
+        input_transforms:
+          task_id: { type: javascript, expr: flow_input.task_id }
+          mode: { type: javascript, expr: flow_input.mode }
+        content: |
+          task_id="$1"
+          mode="${2:-stub}"
+          >&2 echo "[test_design] task=$task_id mode=$mode"
+          # РЕАЛЬНЫЙ режим: claude -p со скиллом skills/test-design (модель-ревьюер)
+          echo '{"stage":"test_design","artifact":"src/test","status":"done"}' > result.json
+    - id: implement
+      summary: Реализация
+      value:
+        type: rawscript
+        language: bash
+        input_transforms:
+          task_id: { type: javascript, expr: flow_input.task_id }
+          mode: { type: javascript, expr: flow_input.mode }
+        content: |
+          task_id="$1"
+          mode="${2:-stub}"
+          >&2 echo "[implement] task=$task_id mode=$mode"
+          # РЕАЛЬНЫЙ режим: claude -p со скиллом skills/implement (китайская coding-модель)
+          echo '{"stage":"implement","artifact":"src/main","status":"done"}' > result.json
+    - id: gate
+      summary: Гейт качества
+      value:
+        type: rawscript
+        language: bash
+        input_transforms:
+          task_id: { type: javascript, expr: flow_input.task_id }
+          gate_outcome: { type: javascript, expr: flow_input.gate_outcome }
+        content: |
+          task_id="$1"
+          gate_outcome="${2:-pass}"
+          >&2 echo "[gate] task=$task_id verdict=$gate_outcome"
+          # РЕАЛЬНЫЙ режим: mvn verify (тесты+JaCoCo+SpotBugs+Checkstyle) + cross-model ревью
+          echo "{\"stage\":\"gate\",\"verdict\":\"$gate_outcome\"}" > result.json
+    - id: gate_branch
+      summary: Ветка по вердикту гейта
+      value:
+        type: branchone
+        branches:
+          - summary: gate fail — доработка
+            expr: 'results.gate.verdict != "pass"'
+            modules:
+              - id: rework
+                summary: Доработка
+                value:
+                  type: rawscript
+                  language: bash
+                  input_transforms: {}
+                  content: |
+                    >&2 echo "[rework] гейт не пройден — возврат в test_design (в пилоте: отметка)"
+                    echo '{"stage":"rework","status":"needs_rework"}' > result.json
+        default:
+          - id: approval
+            summary: Ручной аппрув перед prod
+            suspend:
+              required_events: 1
+              timeout: 86400
+            value:
+              type: rawscript
+              language: bash
+              input_transforms: {}
+              content: |
+                >&2 echo "[approval] ожидание ручного аппрува (Windmill suspend)"
+                echo '{"stage":"approval","status":"approved"}' > result.json
+          - id: prod
+            summary: Выкатка в prod
+            value:
+              type: rawscript
+              language: bash
+              input_transforms: {}
+              content: |
+                >&2 echo "[prod] выкатка в prod (stub)"
+                echo '{"stage":"prod","status":"deployed"}' > result.json
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    task_id:
+      type: string
+      description: ID задачи
+    task_text:
+      type: string
+      description: Текст бизнес-задачи
+    mode:
+      type: string
+      description: stub | real
+      default: stub
+    gate_outcome:
+      type: string
+      description: 'STUB: вердикт гейта для проверки веток (pass|fail)'
+      default: pass
+  required:
+    - task_id

@@ -1,0 +1,57 @@
+# LiteLLM proxy — Anthropic-passthrough routing for non-anthropic backends.
+# Documentation: https://docs.litellm.ai/docs/proxy/configs
+# Config-version target: LiteLLM v1.86.x. Pin when bumping.
+
+model_list:
+  # DeepSeek primary (Sonnet equivalent)
+  - model_name: deepseek-v4-pro
+    litellm_params:
+      model: anthropic/deepseek-v4-pro
+      api_base: https://api.deepseek.com/anthropic
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+  # DeepSeek flash (Haiku equivalent / cheap subagent model)
+  - model_name: deepseek-v4-flash
+    litellm_params:
+      model: anthropic/deepseek-v4-flash
+      api_base: https://api.deepseek.com/anthropic
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+  # GLM primary
+  - model_name: glm-4.6
+    litellm_params:
+      model: anthropic/glm-4.6
+      api_base: https://api.z.ai/api/anthropic
+      api_key: os.environ/GLM_API_KEY
+
+  # GLM flash
+  - model_name: glm-4.5-flash
+    litellm_params:
+      model: anthropic/glm-4.5-flash
+      api_base: https://api.z.ai/api/anthropic
+      api_key: os.environ/GLM_API_KEY
+
+router_settings:
+  # Cooldown a model_group for 5 minutes after a 429 / rate-limit response.
+  cooldown_time: 300
+  # Retry up to 3 times before moving on to the fallback model_group.
+  num_retries: 3
+  # Cross-provider fallback chain on persistent failure.
+  fallbacks:
+    - deepseek-v4-pro: ["glm-4.6"]
+    - glm-4.6: ["deepseek-v4-pro"]
+    - deepseek-v4-flash: ["glm-4.5-flash"]
+    - glm-4.5-flash: ["deepseek-v4-flash"]
+  request_timeout: 600
+  routing_strategy: simple-shuffle
+
+general_settings:
+  # Master key required on every request — set via LITELLM_MASTER_KEY env var.
+  master_key: os.environ/LITELLM_MASTER_KEY
+  # No DB; use sqlite for budgets if we ever turn them on. For now ephemeral.
+  database_url: null
+
+litellm_settings:
+  drop_params: true                  # drop unsupported provider-specific params silently
+  set_verbose: false                 # set true for one-off debugging only
+  telemetry: false                   # no upstream telemetry

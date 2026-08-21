@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/botctl-common.sh"
+
+load_env
+require_cmd curl
+require_cmd jq
+
+BOT_HTTP_URL="${BOT_HTTP_URL:-http://127.0.0.1:8766}"
+
+usage() {
+  echo "Usage: $0 <project> <prompt> [--new] [--chrome] [--parent=<task_id>] [--backend=<name>]" >&2
+  echo "  project        Absolute path to target project directory" >&2
+  echo "  prompt         Brief for sub-Claude (quote if multi-line)" >&2
+  echo "  --new          Request fresh sub-Claude session" >&2
+  echo "  --chrome       Request chromedevtools MCP access" >&2
+  echo "  --parent=<id>  Chain dispatch under existing parent task_id" >&2
+  echo "  --backend=<name>  'deepseek' (default; cheap, for Dev/Test/Sec/Reviewer)" >&2
+  echo "                    or 'anthropic' (Max Opus; use for BA + Architect)" >&2
+  exit 2
+}
+
+if [[ $# -lt 2 ]]; then
+  usage
+fi
+
+project="$1"
+prompt="$2"
+shift 2
+
+new_session=false
+chrome=false
+parent_task_id=""
+backend="deepseek"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --new) new_session=true ;;
+    --chrome) chrome=true ;;
+    --parent=*) parent_task_id="${1#*=}" ;;
+    --parent) parent_task_id="$2"; shift ;;
+    --backend=*) backend="${1#*=}" ;;
+    --backend) backend="$2"; shift ;;
+    *) echo "ERROR: unknown flag: $1" >&2; usage ;;
+  esac
+  shift
+done
+
+case "$backend" in
+  deepseek|anthropic) ;;
+  *) echo "ERROR: --backend must be 'deepseek' or 'anthropic'" >&2; exit 2 ;;
+esac
+
+if [[ "$project" != /* ]]; then
+  echo "ERROR: project must be an absolute path" >&2
+  exit 2
+fi
+
+if [[ ! -d "$project" ]]; then
+  echo "ERROR: project directory does not exist: $project" >&2
+  exit 2
+fi
+
+payload=$(jq -n \
+  --arg project "$project" \
+  --arg prompt "$prompt" \
+  --argjson new_session "$new_session" \
+  --argjson chrome "$chrome" \
+  --arg parent "$parent_task_id" \
+  --arg backend "$backend" \
+  '{project: $project, prompt: $prompt, new_session: $new_session, chrome: $chrome, backend: $backend}
+   + (if $parent != "" then {parent_task_id: $parent} else {} end)')
+
+response=$(curl -s -w '\n%{http_code}' --max-time 10 \
+  -X POST "${BOT_HTTP_URL}/run-in-project" \
+  -H "Content-Type: application/json" \
+  -d "$payload")
+
+http_code=$(echo "$response" | tail -n1)
+body=$(echo "$response" | sed '$d')
+
+case "$http_code" in
+  200)
+    echo "$body"
+    ;;
+  409)
+    echo "project busy" >&2
+    exit 2
+    ;;
+  *)
+    echo "$body" >&2
+    exit 1
+    ;;
+esac

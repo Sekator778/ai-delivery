@@ -1,0 +1,34 @@
+# Force LF line endings everywhere. Windows clients should NOT convert to CRLF.
+# Background: prior CRLF pollution incident in telegram-userbot-ai cost us an hour
+# of git diff archaeology. Lock LF from commit 1, never relax.
+
+* text=auto eol=lf
+
+# Shell scripts MUST be LF — bash refuses CRLF shebangs silently.
+*.sh        text eol=lf
+*.bash      text eol=lf
+
+# Python, YAML, JSON, TOML, Markdown — explicit LF.
+*.py        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.toml      text eol=lf
+*.md        text eol=lf
+*.env       text eol=lf
+.env.example text eol=lf
+
+# Binary files — never touch.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.zip       binary
+*.tar.gz    binary
+*.ogg       binary
+*.wav       binary
+*.mp3       binary
+*.bin       binary
+*.onnx      binary

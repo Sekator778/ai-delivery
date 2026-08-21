@@ -1,0 +1,14 @@
+# Installed by ops/install-docker-prune-timer.sh.
+# Persistent=true so a prune missed while the host was down (WSL shut, laptop
+# suspended, etc.) fires on next boot — we don't want dangling layers to pile
+# up across long offline periods.
+[Unit]
+Description=Fire the safe weekly Docker prune
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+Unit=docker-prune.service
+
+[Install]
+WantedBy=timers.target

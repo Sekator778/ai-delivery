@@ -1,0 +1,35 @@
+[Unit]
+Description=AI Delivery — task-dispatcher daemon (file-queue pipeline runner)
+After=network-online.target ai-delivery-windmill.service claude-tg-bot.service
+Wants=network-online.target ai-delivery-windmill.service claude-tg-bot.service
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=<USER>
+Group=<USER>
+WorkingDirectory=<REPO_ROOT>
+ExecStart=/usr/bin/python3 dispatcher/task_dispatcher.py
+Environment=PYTHONUNBUFFERED=1
+Environment=DISPATCHER_POLL_INTERVAL=5
+Environment=DISPATCHER_LOG_LEVEL=INFO
+Environment=DISPATCHER_MAX_STAGES=3
+Environment=STAGE_RUNNER_LOG_LEVEL=INFO
+Environment=CLAUDE_BIN=claude
+Environment=BOT_HTTP_URL=http://127.0.0.1:8766
+# TRIAGE_MODE=s-only: act on S-tier tasks (short pipeline) — ai-delivery-private#2.
+Environment=TRIAGE_MODE=s-only
+# STAGE_TIMEOUT_SEC=1800: the 900s default killed a productive M-tier TDD
+# developer stage mid-commit (rc=124).
+Environment=STAGE_TIMEOUT_SEC=1800
+EnvironmentFile=-<HOME>/claude-telegram-bot/.env
+
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=task-dispatcher
+
+[Install]
+WantedBy=multi-user.target

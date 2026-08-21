@@ -1,0 +1,7 @@
+{
+  "trigger": "manual",
+  "user": "your-username",
+  "task_id": "manual-1716743400",
+  "prompt": "p99 latency on /search exceeded 500ms for 15 minutes. Investigate, propose fix.",
+  "target_repo": "/absolute/path/to/your/target-repo"
+}

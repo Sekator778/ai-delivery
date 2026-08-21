@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# botctl-watchdog-status — inspect the cycle/budget watchdog state.
+#
+# Usage:
+#   botctl-watchdog-status                  # summary of all active root tasks
+#   botctl-watchdog-status <root_id>        # detail for one root task
+#
+# Reads ~/.claude-tg-bot/watchdog.json directly — no bot.py required.
+
+set -euo pipefail
+source "$(dirname "$0")/botctl-common.sh"
+
+require_cmd jq
+
+WATCHDOG_FILE="${WATCHDOG_STATE_PATH:-$BOT_DIR/watchdog.json}"
+
+if [[ ! -f "$WATCHDOG_FILE" ]]; then
+    echo '{"roots": {}, "note": "watchdog state file does not exist yet"}'
+    exit 0
+fi
+
+if [[ $# -eq 0 ]]; then
+    jq '{
+        roots: (to_entries | map({
+            key: .key,
+            value: {
+                root_id: .value.root_id,
+                started_at: .value.started_at,
+                total_dispatches: (.value.dispatches | length),
+                by_agent: (
+                    .value.dispatches
+                    | group_by(.agent_role)
+                    | map({key: .[0].agent_role, value: length})
+                    | from_entries
+                ),
+                pending: (.value.dispatches | map(select(.status == "pending")) | length),
+                completed: (.value.dispatches | map(select(.status == "completed")) | length),
+                failed: (.value.dispatches | map(select(.status == "failed")) | length)
+            }
+        }) | from_entries)
+    }' "$WATCHDOG_FILE"
+else
+    root_id="$1"
+    jq --arg rid "$root_id" '.[$rid] // {"error": ("no such root_id: " + $rid)}' \
+        "$WATCHDOG_FILE"
+fi

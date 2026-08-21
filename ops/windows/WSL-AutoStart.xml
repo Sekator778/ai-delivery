@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  Windows Task Scheduler definition for launching WSL Ubuntu on user logon.
+
+  Why:
+    Windows does not start the WSL VM on boot. Without this trigger, after
+    reboot the bot is dead until the user manually opens a WSL terminal.
+    With this task, WSL boots automatically right after Windows logon, which
+    in turn starts systemd, docker, the containers, and claude-tg-bot.service.
+
+  How to register (one-time, from PowerShell as the user, NOT admin):
+    Register-ScheduledTask -Xml (Get-Content -Raw $env:USERPROFILE\projects\ai-delivery\ops\windows\WSL-AutoStart.xml) -TaskName "WSL Ubuntu Autostart" -Force
+
+  Verify:
+    Get-ScheduledTask -TaskName "WSL Ubuntu Autostart"
+    # State should be "Ready", LastRunTime updates after each logon.
+
+  Remove:
+    Unregister-ScheduledTask -TaskName "WSL Ubuntu Autostart" -Confirm:$false
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Launches the default WSL2 distribution on user logon so the ai-delivery bot + containers come back up automatically after Windows reboot.</Description>
+    <URI>\WSL Ubuntu Autostart</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT15S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>false</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>wsl.exe</Command>
+      <Arguments>-d Ubuntu --exec true</Arguments>
+    </Exec>
+  </Actions>
+</Task>

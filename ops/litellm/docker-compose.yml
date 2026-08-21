@@ -1,0 +1,28 @@
+# Single-container LiteLLM proxy for the ai-delivery pipeline.
+# Listens on 127.0.0.1:4000 (loopback only — no LAN exposure).
+# Brought up by: `cd ops/litellm && docker compose up -d`
+
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: ai-delivery-litellm
+    restart: unless-stopped
+    # Loopback bind only — proxy is for local stage_runner / bot, not LAN.
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    env_file:
+      - .env
+    command: >-
+      --config /app/config.yaml
+      --port 4000
+      --host 0.0.0.0
+    healthcheck:
+      # The litellm image ships no `curl`; use its bundled python to probe the
+      # liveliness endpoint instead (was failing "curl: not found" → unhealthy).
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').getcode()==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

@@ -1,0 +1,15 @@
+{
+  "_doc": "Project registry — short alias → target repo. Used by /task @<alias> <prompt> and /projects in bot.py, and by the dispatcher to resolve each target's base branch. Copy to projects.json (gitignored), edit paths to match your host. Bot reload via systemctl restart picks up changes.",
+  "_entry_forms": "An entry is either a plain path string (legacy, still supported) or {\"path\": \"...\", \"base\": \"<branch>\"}. `base` pins the branch the pipeline cuts its work branch from AND targets with the PR. Resolution order: this `base` → PIPELINE_BASE_BRANCH env → the repo's own origin/HEAD → 'main'. Set it whenever development does not live on the repo's default branch.",
+  "_default": "sandbox",
+  "projects": {
+    "sandbox": "/home/<user>/projects/ai-delivery-sandbox",
+    "userbot": {
+      "path": "/home/<user>/projects/telegram-userbot-ai"
+    },
+    "ai-delivery": {
+      "path": "/home/<user>/projects/ai-delivery",
+      "base": "dev"
+    }
+  }
+}

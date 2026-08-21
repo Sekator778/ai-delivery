@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/botctl-common.sh"
+
+load_env
+
+if [[ -z "${DEFAULT_PROJECT_DIR:-}" ]] || [[ ! -d "$DEFAULT_PROJECT_DIR" ]]; then
+  echo "ERROR: DEFAULT_PROJECT_DIR is not set or not a directory" >&2
+  exit 1
+fi
+
+find "$DEFAULT_PROJECT_DIR" -maxdepth 2 -type d -name ".git" -exec dirname {} \; | sort

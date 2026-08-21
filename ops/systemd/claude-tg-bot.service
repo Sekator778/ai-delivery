@@ -1,0 +1,25 @@
+[Unit]
+Description=ai-delivery bot.py — Telegram + meta-Claude router
+Documentation=https://github.com/Sekator778/ai-delivery
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+# Allow up to 5 restarts in 60s before giving up.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=<USER>
+WorkingDirectory=<REPO_ROOT>/bot
+ExecStart=<REPO_ROOT>/bot/start.sh
+Environment=THIN_MODE_ENABLED=true
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:<HOME>/.claude-tg-bot/bot.log
+StandardError=append:<HOME>/.claude-tg-bot/bot.log
+# Don't kill children — bot.py spawns long-lived meta-Claude subprocesses.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

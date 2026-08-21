@@ -1,0 +1,27 @@
+{
+  "id": "TASK-0000",
+  "jira_key": null,
+  "title": "",
+  "source": "telegram",
+  "submitted_by": "",
+  "submitted_at": null,
+  "stage": "received",
+  "autonomy_level": "pr",
+  "branch": null,
+  "worktree": null,
+  "triage": { "verdict": null, "estimate": null },
+  "models_used": {},
+  "cost_usd": 0.0,
+  "costs": {},
+  "retries": { "gate": 0 },
+  "blockers": [],
+  "approval": {
+    "required_for": "prod",
+    "granted": false,
+    "granted_by": null,
+    "granted_at": null
+  },
+  "history": [
+    { "at": null, "stage": "received", "note": "task created by the intake bot" }
+  ]
+}

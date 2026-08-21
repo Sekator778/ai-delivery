@@ -1,0 +1,123 @@
+# AI Delivery — pipeline trigger flow.
+#
+# Drops a tasks/inbox/<task-id>/spec.json file. The dispatcher daemon
+# (~/projects/ai-delivery/dispatcher/task_dispatcher.py, supervised by
+# task-dispatcher.service) polls /tasks/inbox and moves the folder to
+# active/, then drives BA -> Architect -> Dev -> Test -> Sec -> Reviewer.
+#
+# This is the **Windmill entry point** for the Phase 5 pipeline. Pair it
+# with a Windmill schedule (cron) or invoke it directly from the UI.
+# The Telegram bot uses a different path: it writes to tasks/inbox/ from
+# the host, so it does not call this flow.
+#
+# Deploy:
+#   wmill flow push windmill/flows/pipeline-trigger.flow f/ai_delivery/pipeline_trigger \
+#       --workspace ai-delivery --base-url http://localhost/ --token <TOKEN>
+#
+# Required bind-mount on the worker:
+#   volumes:
+#     - ../tasks/inbox:/tasks/inbox    # added in windmill_worker_aidelivery
+summary: AI Delivery - pipeline trigger
+description: >-
+  Writes tasks/inbox/<task-id>/spec.json so the dispatcher picks up the
+  pipeline run. Use as the target of a Windmill schedule for cron-driven
+  runs (nightly deps bump, weekly security audit, etc.).
+value:
+  same_worker: false
+  modules:
+    - id: write_spec
+      summary: Write spec.json to tasks/inbox
+      value:
+        type: rawscript
+        language: bash
+        input_transforms:
+          prompt:
+            type: javascript
+            expr: flow_input.prompt
+          target_repo:
+            type: javascript
+            expr: flow_input.target_repo
+          task_id:
+            type: javascript
+            expr: flow_input.task_id
+          schedule:
+            type: javascript
+            expr: flow_input.schedule
+          iteration_cap:
+            type: javascript
+            expr: flow_input.iteration_cap
+          cost_cap_usd:
+            type: javascript
+            expr: flow_input.cost_cap_usd
+        content: |
+          set -euo pipefail
+          inbox=/tasks/inbox
+          if [ ! -d "$inbox" ]; then
+            echo "ERROR: $inbox is not mounted into the worker — add" >&2
+            echo "  - ../tasks/inbox:/tasks/inbox" >&2
+            echo "to windmill_worker_aidelivery in docker-compose.yml" >&2
+            exit 2
+          fi
+
+          # Allocate task_id if not provided. Use UTC timestamp for uniqueness
+          # without coordinating with the dispatcher (the dispatcher tolerates
+          # any kebab-case slug per spec.schema.json).
+          if [ -z "${task_id:-}" ] || [ "${task_id:-}" = "null" ]; then
+            task_id="wm-$(date -u +%Y%m%dT%H%M%S)-$RANDOM"
+          fi
+
+          # Build spec.json with python to handle quoting/multiline cleanly.
+          payload="$(python3 - <<'PY'
+          import json, os, sys
+          spec = {
+              "trigger": "windmill",
+              "user": "windmill-cron",
+              "prompt": os.environ["PROMPT"],
+              "target_repo": os.environ["TARGET_REPO"],
+              "task_id": os.environ["TASK_ID"],
+              "created_at": __import__("datetime").datetime.now(
+                  __import__("datetime").timezone.utc
+              ).isoformat(timespec="seconds"),
+          }
+          if os.environ.get("SCHEDULE"):
+              spec["schedule"] = os.environ["SCHEDULE"]
+          if os.environ.get("ITERATION_CAP"):
+              spec["iteration_cap"] = int(os.environ["ITERATION_CAP"])
+          if os.environ.get("COST_CAP_USD"):
+              spec["cost_cap_usd"] = float(os.environ["COST_CAP_USD"])
+          print(json.dumps(spec, indent=2))
+          PY
+          )"
+          export PROMPT="$prompt" TARGET_REPO="$target_repo" TASK_ID="$task_id"
+          export SCHEDULE="${schedule:-}" ITERATION_CAP="${iteration_cap:-}" COST_CAP_USD="${cost_cap_usd:-}"
+
+          mkdir -p "$inbox/$task_id"
+          printf '%s\n' "$payload" > "$inbox/$task_id/spec.json"
+          echo "wrote $inbox/$task_id/spec.json"
+          printf '{"task_id":"%s"}\n' "$task_id" > result.json
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  required: [prompt, target_repo]
+  properties:
+    prompt:
+      type: string
+      title: Prompt (the task)
+      description: Free-text task description. Goes to the BA stage verbatim.
+    target_repo:
+      type: string
+      title: Target repo (absolute path or git URL)
+      default: ""
+    task_id:
+      type: [string, "null"]
+      title: Task id (optional)
+      description: kebab-case slug; auto-generated if empty.
+    schedule:
+      type: [string, "null"]
+      title: Schedule (cron, informational)
+    iteration_cap:
+      type: [integer, "null"]
+      title: Iteration cap (default 3)
+    cost_cap_usd:
+      type: [number, "null"]
+      title: Cost cap USD (default 20)

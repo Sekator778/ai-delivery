@@ -1,0 +1,44 @@
+# ops/publish-blocklist.local — project-specific PII/secret patterns
+#
+# One POSIX ERE per line. Blank lines and lines starting with # are ignored.
+# Patterns are matched against file content with grep -rIlE (binary files skipped).
+# A match on any file blocks the publish until that content is removed or
+# the line is removed from this file.
+#
+# HOW TO USE:
+#   cp ops/publish-blocklist.local.example ops/publish-blocklist.local
+#   Fill in patterns for your host's real identifiers below.
+#   The .local file is gitignored; only this .example is tracked.
+#
+# IMPORTANT: this .example file itself is exported and scanned on every
+# publish — patterns in this file must NOT match themselves. Use regex
+# constructs with wildcards or character classes rather than literal values.
+
+# ---------------------------------------------------------------------------
+# Example: internal LAN IP ranges
+# Replace [0-9]+ with the actual octets of your LAN ranges in the .local file.
+# ---------------------------------------------------------------------------
+# 192\.168\.[0-9]+\.[0-9]+
+# 10\.[0-9]+\.[0-9]+\.[0-9]+
+# 172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+
+
+# ---------------------------------------------------------------------------
+# Example: internal hostnames
+# Replace the character class with a literal hostname prefix in the .local file.
+# ---------------------------------------------------------------------------
+# [a-z]+-dev[0-9]+\.internal
+# devbox-[0-9]+\.lan
+# [a-z]+\.corp\.example\.com
+
+# ---------------------------------------------------------------------------
+# Example: account or project ID shapes
+# ---------------------------------------------------------------------------
+# [Aa]ccount[-_]?[Ii][Dd]:\s*[0-9]{8,}
+# [Pp]roject[-_][Ii][Dd]=[A-Z0-9]{12,}
+
+# ---------------------------------------------------------------------------
+# Example: personal path fragments
+# Replace the character class with your username in the .local file.
+# ---------------------------------------------------------------------------
+# /home/[a-z][-a-z0-9]+/
+# /Users/[A-Za-z][-A-Za-z0-9]+/projects/
