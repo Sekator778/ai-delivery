@@ -13,7 +13,7 @@ be imported in a test — telegram, aiohttp and a module-level config load — a
 the acceptance asks for an offline test against a mocked spawn. So the driver
 takes its two effects as callbacks:
 
-    spawn(task_id, cwd, prompt, backend) -> SpawnResult
+    spawn(task_id, cwd, prompt, backend, model) -> SpawnResult
     notify(text, files=[...])            -> awaited, delivers to the chat
 
 Everything else — turns, budget, history, caps, refusals — is decided here and
@@ -36,6 +36,7 @@ Three things this gets right that are easy to get wrong:
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,10 +57,14 @@ except Exception:  # pragma: no cover
 
 ROOM_TASK_PREFIX = "room-"
 
+log = logging.getLogger(__name__)
+
 CONDUCTOR_BACKEND = "deepseek"
 CONDUCTOR_STAGE = "room-conductor"
 SPECIALIST_STAGE = "room-specialist"
 MEMORY_STAGE = "room-memory"
+# The extraction child is pure summarising: the cheapest option is the right one.
+EXTRACTION_MODEL = "deepseek-v4-flash"
 
 # Literal retrieval scope for room lessons. Rooms have no target repo, and the
 # write path's ephemeral guard exists for repo PATHS — a stable literal is what
@@ -338,18 +343,24 @@ async def memorize(*, spawn: Spawn, workdir: str, room_id: str, request: str,
             + _strategy.build_extraction_input(trajectory, verdict)
         )
         child = await spawn(task_id=f"{room_id}-mx", cwd=workdir,
-                            prompt=prompt, backend=CONDUCTOR_BACKEND)
+                            prompt=prompt, backend=CONDUCTOR_BACKEND,
+                            model=EXTRACTION_MODEL)
         cost, source = parse_cost(child.output, CONDUCTOR_BACKEND)
         _record_cost(f"{room_id}-mx", MEMORY_STAGE, CONDUCTOR_BACKEND,
                      cost, source)
         if child.rc != 0:
             return 0
         items = _strategy.parse_memory_items(decision_text(child.output))
-        if not items:
-            return 0
-        return _memory.write_strategy_items(
-            task_id=room_id, scope=ROOM_MEMORY_SCOPE, source_query=request,
-            items=items, verdict=verdict)
+        written = 0
+        if items:
+            written = _memory.write_strategy_items(
+                task_id=room_id, scope=ROOM_MEMORY_SCOPE, source_query=request,
+                items=items, verdict=verdict)
+        # Visible in the bot's log, not only on a stderr nobody reads: the live
+        # check of T30 could not tell "wrote nothing" from "wrote later".
+        log.info("room %s memory: %d item(s) parsed, %d written (%s)",
+                 room_id, len(items), written, verdict.status)
+        return written
     except Exception:  # noqa: BLE001 — memory must never break the room
         return 0
 
@@ -391,21 +402,27 @@ async def run_room(
         remaining = budget - spent
 
         if remaining <= 0:
-            outcome = RoomOutcome("budget", spent_usd=spent, delegations=delegations)
+            files, partial = partial_delivery(workdir, history)
             await notify(
                 f"Бюджет комнаты исчерпан: потрачено ${spent:.2f} из ${budget:.2f}, "
-                f"специалистов отработало {delegations}. Итог не собран — "
-                f"поднимите ROOM_BUDGET_USD и повторите."
+                f"специалистов отработало {delegations}. Финального вердикта "
+                f"дирижёра нет — поднимите ROOM_BUDGET_USD и повторите."
+                + partial,
+                files=files,
             )
-            return await conclude(outcome)
+            return await conclude(RoomOutcome(
+                "budget", spent_usd=spent, delegations=delegations, files=files))
 
         if turn > turns_allowed:
+            files, partial = partial_delivery(workdir, history)
             await notify(
                 f"Лимит ходов исчерпан ({turns_allowed}). Потрачено ${spent:.2f}, "
-                f"специалистов отработало {delegations}, финального ответа нет."
+                f"специалистов отработало {delegations}, финального вердикта нет."
+                + partial,
+                files=files,
             )
-            return await conclude(
-                RoomOutcome("turns", spent_usd=spent, delegations=delegations))
+            return await conclude(RoomOutcome(
+                "turns", spent_usd=spent, delegations=delegations, files=files))
 
         prompt = room.build_prompt(
             request=request, history=history, attempt=turn,
@@ -414,7 +431,7 @@ async def run_room(
         )
         conductor_id = f"{room_id}-c{turn}"
         result = await spawn(task_id=conductor_id, cwd=workdir, prompt=prompt,
-                             backend=CONDUCTOR_BACKEND)
+                             backend=CONDUCTOR_BACKEND, model=None)
 
         # The conductor's own turns are debited. Turn one of the live run was
         # $0.178 — 9% of the default cap before a single specialist ran.
@@ -455,6 +472,25 @@ async def run_room(
 
         delegation = decision.delegation
         assert delegation is not None  # interpret() guarantees it when ok
+
+        # Pre-authorisation (T31): the cap is a permission to hire, not only a
+        # stop between turns. The $0.05 room hired a $0.92 specialist because
+        # nothing checked the price before the child ran.
+        floor = room.min_spend_usd(delegation.option)
+        remaining = budget - spent
+        if remaining < floor:
+            affordable = room.affordable_models(remaining)
+            reason = (f"insufficient budget for {delegation.model}: needs at "
+                      f"least ${floor:.2f}, ${remaining:.2f} left")
+            history.add(room.HistoryEntry(
+                "refused", f"delegation rejected: {reason}",
+                ("Affordable now: " + ", ".join(affordable)) if affordable
+                else "Nothing is affordable now. Finish with what you have.",
+            ))
+            await notify(f"Найм отклонён: {reason}. Дирижёр перевыбирает.")
+            turn += 1
+            continue
+
         delegations += 1
         specialist_id = f"{room_id}-s{delegations}"
         backend = delegation.option.backend
@@ -464,9 +500,13 @@ async def run_room(
             f"({delegation.model}). {delegation.task_instruction[:200]}"
         )
 
+        # The model the conductor paid for is the model that runs (T31): the
+        # live run bought model_3 at the table's price and got the CLI's own
+        # default — a different, dearer model — because nothing pinned it.
         child = await spawn(
             task_id=specialist_id, cwd=workdir,
             prompt=specialist_prompt(delegation, request), backend=backend,
+            model=delegation.option.real_name,
         )
         child_cost, child_source = parse_cost(child.output, backend)
         spent += child_cost
@@ -496,6 +536,29 @@ async def run_room(
             ))
 
         turn += 1
+
+
+def partial_delivery(workdir: str, history: "room.History") -> "tuple[list[str], str]":
+    """What a room cut short by budget or turns can still hand over (T31).
+
+    The live run: a specialist wrote an excellent report, cost more than the
+    cap, and the budget terminal said "nothing was collected" while the file
+    sat on disk. Paid-for work on disk is delivered with an honest label, and
+    the last specialist's own summary is quoted so the owner reads something
+    even when no file exists.
+    """
+    files = collect_deliverables(workdir)
+    last = ""
+    for entry in reversed(history.entries):
+        if entry.kind == "delegation" and "returned" in entry.summary:
+            last = (entry.detail or "").strip()
+            break
+    parts = []
+    if files:
+        parts.append(f"Вот что специалисты успели сделать ({len(files)} файл(ов) ниже).")
+    if last:
+        parts.append("Последний результат специалиста:\n" + last[:1500])
+    return files, ("\n\n" + "\n\n".join(parts)) if parts else ""
 
 
 def collect_deliverables(workdir: str, limit: int = 5) -> "list[str]":

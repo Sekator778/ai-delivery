@@ -13,6 +13,15 @@ the project does not yet follow strict SemVer (pre-1.0).
 
 Entries accumulate here until the next tag.
 
+- **The room's cap is a permission to hire, not only a stop (backlog/T31).**
+  A hire the room cannot pay for is refused before the child runs (per-option
+  floor, reason in the history, the prompt names what is affordable); a room
+  cut short by budget or turns delivers the files and the last specialist's
+  own summary instead of "nothing collected"; and the model the conductor
+  bought is the model the child runs — `run_subtask` gained a `model` pin,
+  so the masked price table stops being fiction on the anthropic backend.
+  Extraction now logs "N parsed, M written" into the bot log.
+
 - **The room remembers (backlog/T30).** Every terminal room outcome now runs
   the T26 strategy extraction over its delegation history — success and
   failure branches picked by a programmatic verdict — and stores the parsed

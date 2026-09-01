@@ -68,9 +68,9 @@ class _Harness:
         self.files: list[str] = []
 
     async def spawn(self, *, task_id: str, cwd: str, prompt: str,
-                    backend: str) -> driver.SpawnResult:
+                    backend: str, model: "str | None" = None) -> driver.SpawnResult:
         self.spawned.append({"task_id": task_id, "backend": backend,
-                             "prompt": prompt, "cwd": cwd})
+                             "prompt": prompt, "cwd": cwd, "model": model})
         index = len(self.spawned) - 1
         output = self.replies[index] if index < len(self.replies) else _with_cost("")
         return driver.SpawnResult(rc=0, output=output)

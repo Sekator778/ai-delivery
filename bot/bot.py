@@ -3058,8 +3058,14 @@ async def requeue_command(update: Update, context: object) -> None:
 # Sub-Claude delegation (M3)
 # ---------------------------------------------------------------------------
 
-def _subagent_env(backend: str = "deepseek") -> dict[str, str]:
-    """Build env for sub-Claude subprocess.
+def _subagent_env(backend: str = "deepseek",
+                  model: "str | None" = None) -> dict[str, str]:
+    """Build env for sub-Claude subprocess; `model` pins ANTHROPIC_MODEL.
+
+    The pin exists because of the room (T31): the conductor buys a model by
+    its price and nothing made the child run it — on the anthropic backend the
+    CLI used the operator's own default, on deepseek always the primary. With
+    `model` set, the option's real name is what runs, on either backend.
 
     Two backends:
 
@@ -3096,6 +3102,8 @@ def _subagent_env(backend: str = "deepseek") -> dict[str, str]:
             "CLAUDE_CODE_SUBAGENT_MODEL",
         ):
             env.pop(k, None)
+        if model:
+            env["ANTHROPIC_MODEL"] = model
         return env
     # backend == "deepseek" (or unknown — treat as deepseek)
     api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
@@ -3121,6 +3129,8 @@ def _subagent_env(backend: str = "deepseek") -> dict[str, str]:
     env["CLAUDE_CODE_SUBAGENT_MODEL"] = os.environ.get(
         "DEEPSEEK_MODEL_SUBAGENT", "deepseek-v4-flash"
     )
+    if model:
+        env["ANTHROPIC_MODEL"] = model
     return env
 
 
@@ -3162,10 +3172,11 @@ async def room_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
     async def _spawn(*, task_id: str, cwd: str, prompt: str,
-                     backend: str) -> "room_driver.SpawnResult":
+                     backend: str, model: "str | None" = None,
+                     ) -> "room_driver.SpawnResult":
         rc, output = await run_subtask(
             task_id=task_id, project=cwd, prompt=prompt,
-            new_session=True, chrome=False, backend=backend,
+            new_session=True, chrome=False, backend=backend, model=model,
         )
         return room_driver.SpawnResult(rc=rc, output=output)
 
@@ -3196,6 +3207,7 @@ async def run_subtask(
     chrome: bool,
     root_id: str | None = None,
     backend: str = "deepseek",
+    model: "str | None" = None,
 ) -> "tuple[int, str]":
     """Run one sub-Claude to completion. Returns (rc, joined stdout).
 
@@ -3211,7 +3223,7 @@ async def run_subtask(
         "--output-format", "stream-json",
         "--verbose",
     ]
-    env = _subagent_env(backend)
+    env = _subagent_env(backend, model)
     actual_backend = "DeepSeek" if env.get("ANTHROPIC_BASE_URL", "").endswith("deepseek.com/anthropic") else "Max"
     logger.info(
         "Starting sub-Claude task_id=%s project=%s new_session=%s chrome=%s backend=%s",

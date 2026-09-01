@@ -140,6 +140,26 @@ def masked_models() -> dict[str, ModelOption]:
     return {f"model_{i}": opt for i, opt in enumerate(MODEL_CATALOGUE, 1)}
 
 
+# Pre-authorisation floor (T31). A specialist is never free: the live runs put
+# a web-research child at $0.9-2.3 on the anthropic option and a conductor turn
+# at ~$0.05. The floor is a conservative minimum spend per option — its price
+# times a small token allowance — and the driver REFUSES a hire the room cannot
+# pay for, instead of discovering the overspend after the child has run (the
+# $0.05 room that spent $0.97). Ordering, not invoicing: the ledger does that.
+MIN_SPECIALIST_MTOK = 0.15
+
+
+def min_spend_usd(option: ModelOption) -> float:
+    """Least the room must still hold to hire on this option."""
+    return round(option.price_per_mtok * MIN_SPECIALIST_MTOK, 2)
+
+
+def affordable_models(budget_left_usd: float) -> list[str]:
+    """Masked names the room can currently pay for, cheapest first."""
+    return [mask for mask, opt in masked_models().items()
+            if min_spend_usd(opt) <= budget_left_usd]
+
+
 def pricing_table() -> str:
     """Markdown price table for the prompt, masked names only.
 
@@ -384,6 +404,16 @@ def build_prompt(
         budget_note += " EXHAUSTED — you must finish now."
     elif attempt >= max_attempts:
         budget_note += " This is your LAST attempt — finish with what you have."
+    affordable = affordable_models(budget_left_usd)
+    if len(affordable) < len(MODEL_CATALOGUE):
+        # Only when something is out of reach: with a fresh budget every
+        # option is affordable and the prompt stays byte-for-byte as before.
+        floors = "; ".join(
+            f"{mask} needs at least ${min_spend_usd(opt):.2f}"
+            for mask, opt in masked_models().items() if mask not in affordable)
+        budget_note += (
+            f" Affordable now: {', '.join(affordable) or 'none'} ({floors}). "
+            "A hire the room cannot pay for is refused before it runs.")
 
     memory_section = f"\nPAST STRATEGIES\n{memory_block}\n" if memory_block else ""
 
