@@ -138,7 +138,13 @@ readonly CLAUDE_KEEP_PREFIXES=(.claude/agents .claude/commands)
 # public-repo artifact. The public mirror has never carried a top-level
 # CLAUDE.md; keep it that way rather than sanitizing content that stops
 # making sense once you're already inside the public-only repo.
-readonly EXCLUDE_FILES=(bot/projects.json CLAUDE.md)
+# ops/leak-watch.py polls public GitHub for corporate markers and therefore
+# carries those markers verbatim in its docstrings — publishing the watcher
+# would publish exactly what it watches for. .gitleaksignore pins fingerprints
+# (paths + commit SHAs) of the PRIVATE history; the mirror's squashed history
+# shares none of those commits, so the file is meaningless there and leaks
+# private-tree paths. Both recorded private on publication resume, 2026-09-01.
+readonly EXCLUDE_FILES=(bot/projects.json CLAUDE.md ops/leak-watch.py .gitleaksignore)
 # tasks/ keep list: anything else under tasks/ is excluded
 readonly TASKS_KEEP_PATTERN="tasks/_TEMPLATE"
 readonly BLOCKLIST_FILE="$REPO_ROOT/ops/publish-blocklist.local"

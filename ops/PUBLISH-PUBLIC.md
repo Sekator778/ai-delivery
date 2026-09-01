@@ -1,12 +1,13 @@
-# Publishing to the Public Mirror — PAUSED
+# Publishing to the Public Mirror
 
-> **Status (2026-08-21): publication is paused, the mirror is NOT gone.**
-> `github.com/Sekator778/ai-delivery` is live and public; current development
-> happens only in the private repository and the mirror is no longer refreshed.
-> Two things follow: do not run this flow on your own initiative — resuming is
-> the owner's decision — and **never `git push` to the mirror**, whatever a
-> clone's remotes happen to say. Everything below is the mechanism as built,
-> ready for the day publishing resumes.
+> **Status (2026-09-01): publication is LIVE again** (owner decision; it was
+> paused 2026-08-21 → 2026-09-01). Development happens only in the private
+> repository; the mirror receives sanitized squash releases after milestones,
+> as part of the release ritual (ops/RELEASE.md). Two things still follow:
+> a publish is a deliberate act behind an owner decision, not something to
+> run on your own initiative — and **never `git push` to the mirror**: the
+> only path is this flow, with its gates. First resumed publish: v1.2.0
+> (mirror commit `63cf00f`).
 
 `scripts/publish-public.sh` is the single supported path for refreshing the
 public mirror (`github.com/Sekator778/ai-delivery`, remote `public-mirror`).

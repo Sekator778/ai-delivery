@@ -1,10 +1,10 @@
 # Changelog
 
 All notable changes to ai-delivery are listed here. Dates are when the
-milestone landed on the development branch (private upstream). The public
-mirror still exists but is no longer refreshed — publication is paused since
-2026-08-21 and development happens privately — so a "release" is a tag on
-`dev` until the owner resumes publishing.
+milestone landed on the development branch (private upstream). Development
+happens privately; releases are forwarded to the public mirror as sanitized
+squash commits through the gated export (publication resumed 2026-09-01
+after a pause since 2026-08-21).
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project does not yet follow strict SemVer (pre-1.0).

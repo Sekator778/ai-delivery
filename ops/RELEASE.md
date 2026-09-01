@@ -75,9 +75,24 @@ from the default branch.
       that would have caught it the first time.
 - [ ] `STATE/CURRENT.md` notes the release.
 
-## Publishing
+## Publish to the mirror
 
-Not part of either checklist. The public mirror is live but **no longer
-refreshed** — publication has been paused since 2026-08-21 and resuming it is a
-deliberate owner decision, run through `scripts/publish-public.sh` and nothing
-else. See `CLAUDE.md` §1 and [PUBLISH-PUBLIC.md](PUBLISH-PUBLIC.md).
+Part of the tag checklist since 2026-09-01 (owner decision: publication
+resumed so outside contributors can follow the project). After the tag is on
+`master`:
+
+- [ ] Dry-run and read the output — gates clean, no `NEW TOP-LEVEL PATH`
+      surprises, the ADDITIONS/DELETIONS diff matches what the release did:
+
+```bash
+scripts/publish-public.sh --ref dev
+```
+
+- [ ] Publish (the script verifies the mirror tip after the push):
+
+```bash
+scripts/publish-public.sh --ref dev --push --push-url git@github.com:Sekator778/ai-delivery.git
+```
+
+Only this script — **never `git push` to the mirror**. Details and rollback:
+`CLAUDE.md` §1, [PUBLISH-PUBLIC.md](PUBLISH-PUBLIC.md).
