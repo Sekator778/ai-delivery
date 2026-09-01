@@ -42,17 +42,29 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 import room_conductor as room
+import strategy_memory as _strategy
 
 try:  # pragma: no cover - the ledger is best-effort and optional in tests
     import backend_routing as _routing
 except Exception:  # pragma: no cover
     _routing = None
 
+try:  # pragma: no cover - memory is best-effort; tests monkeypatch it
+    import memory_inject as _memory
+except Exception:  # pragma: no cover
+    _memory = None
+
 ROOM_TASK_PREFIX = "room-"
 
 CONDUCTOR_BACKEND = "deepseek"
 CONDUCTOR_STAGE = "room-conductor"
 SPECIALIST_STAGE = "room-specialist"
+MEMORY_STAGE = "room-memory"
+
+# Literal retrieval scope for room lessons. Rooms have no target repo, and the
+# write path's ephemeral guard exists for repo PATHS — a stable literal is what
+# lets the next room's scoped recall pass find room lessons at all (T30).
+ROOM_MEMORY_SCOPE = "room"
 
 # One reprompt on a malformed conductor reply, then an honest refusal. Not
 # unlimited: a conductor that cannot produce JSON twice in a row will not
@@ -266,6 +278,83 @@ Finish with a short plain-text summary of what you did and what you found.
 
 
 # ---------------------------------------------------------------------------
+# Strategy memory — recall on the way in, extraction on the way out (T30)
+# ---------------------------------------------------------------------------
+def recall_strategies(request: str) -> str:
+    """Recalled-strategies block for the conductor's prompt, or "".
+
+    Only records that parse as full strategies (title/description/content —
+    the T26 typed schema) are injected; legacy prose hits would be noise in a
+    hiring decision. Empty on any miss: flag off, memory infra down, store
+    empty, or nothing relevant. The conductor prompt is then byte-identical
+    to the pre-T30 one.
+    """
+    if _memory is None or not _strategy.strategy_enabled():
+        return ""
+    try:
+        hits = _memory.recall(request, ROOM_MEMORY_SCOPE)
+    except Exception:
+        return ""
+    items = []
+    for hit in hits:
+        payload = hit.get("payload") or {}
+        title = str(payload.get("title") or "").strip()
+        description = str(payload.get("description") or "").strip()
+        content = str(payload.get("content") or "").strip()
+        if title and description and content:
+            items.append(_strategy.StrategyItem(title, description, content))
+    return _strategy.format_strategy_block(items)
+
+
+async def memorize(*, spawn: Spawn, workdir: str, room_id: str, request: str,
+                   history: "room.History", outcome: RoomOutcome) -> int:
+    """Extract strategies from the finished room and store them.
+
+    Runs AFTER the outcome has been delivered to the chat: the owner's answer
+    never waits on memory, and a memory failure of any kind is a logged zero,
+    not an exception into the loop. The verdict is programmatic (`gt`) — a
+    room that reached `finished` delivered something, and every other terminal
+    status is a fact of failure; no judge needed.
+
+    The extraction is one cheap child over the delegation history — the T26
+    prompts, picked by verdict branch, exactly as the pipeline would use them.
+    Its cost lands in the ledger under `room-memory` but not in the room's
+    budget: the room has already concluded and reported its spend.
+    """
+    if _memory is None or not _strategy.strategy_enabled():
+        return 0
+    try:
+        verdict = _strategy.Verdict(
+            "success" if outcome.status == "finished" else "fail", "gt")
+        trajectory = (
+            f"REQUEST: {request}\n\n{history.render()}\n\n"
+            f"OUTCOME: {outcome.status} after {outcome.delegations} "
+            f"specialist(s), ${outcome.spent_usd:.2f} spent."
+            + (f"\nFINAL SUMMARY: {outcome.summary}" if outcome.summary else "")
+        )
+        prompt = (
+            _strategy.extraction_prompt(verdict)
+            + "\n\nTRAJECTORY\n"
+            + _strategy.build_extraction_input(trajectory, verdict)
+        )
+        child = await spawn(task_id=f"{room_id}-mx", cwd=workdir,
+                            prompt=prompt, backend=CONDUCTOR_BACKEND)
+        cost, source = parse_cost(child.output, CONDUCTOR_BACKEND)
+        _record_cost(f"{room_id}-mx", MEMORY_STAGE, CONDUCTOR_BACKEND,
+                     cost, source)
+        if child.rc != 0:
+            return 0
+        items = _strategy.parse_memory_items(decision_text(child.output))
+        if not items:
+            return 0
+        return _memory.write_strategy_items(
+            task_id=room_id, scope=ROOM_MEMORY_SCOPE, source_query=request,
+            items=items, verdict=verdict)
+    except Exception:  # noqa: BLE001 — memory must never break the room
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # The loop
 # ---------------------------------------------------------------------------
 async def run_room(
@@ -288,6 +377,16 @@ async def run_room(
     parse_retries = 0
     turn = 1
 
+    # Recalled once per room, not per turn: the store does not change while
+    # this room runs, and the block belongs to the request, not to a turn.
+    memory_block = recall_strategies(request)
+
+    async def conclude(outcome: RoomOutcome) -> RoomOutcome:
+        """Terminal bookkeeping — after the chat already has its answer."""
+        await memorize(spawn=spawn, workdir=workdir, room_id=room_id,
+                       request=request, history=history, outcome=outcome)
+        return outcome
+
     while True:
         remaining = budget - spent
 
@@ -298,18 +397,20 @@ async def run_room(
                 f"специалистов отработало {delegations}. Итог не собран — "
                 f"поднимите ROOM_BUDGET_USD и повторите."
             )
-            return outcome
+            return await conclude(outcome)
 
         if turn > turns_allowed:
             await notify(
                 f"Лимит ходов исчерпан ({turns_allowed}). Потрачено ${spent:.2f}, "
                 f"специалистов отработало {delegations}, финального ответа нет."
             )
-            return RoomOutcome("turns", spent_usd=spent, delegations=delegations)
+            return await conclude(
+                RoomOutcome("turns", spent_usd=spent, delegations=delegations))
 
         prompt = room.build_prompt(
             request=request, history=history, attempt=turn,
             max_attempts=turns_allowed, budget_left_usd=remaining,
+            memory_block=memory_block,
         )
         conductor_id = f"{room_id}-c{turn}"
         result = await spawn(task_id=conductor_id, cwd=workdir, prompt=prompt,
@@ -331,8 +432,9 @@ async def run_room(
                     f"({decision.error}). Останавливаюсь, чтобы не тратить "
                     f"бюджет впустую. Потрачено ${spent:.2f}."
                 )
-                return RoomOutcome("unparseable", summary=decision.error,
-                                   spent_usd=spent, delegations=delegations)
+                return await conclude(
+                    RoomOutcome("unparseable", summary=decision.error,
+                                spent_usd=spent, delegations=delegations))
             # The failure is already in the history with its repair hint, so the
             # next prompt shows the conductor its own mistake.
             turn += 1
@@ -346,9 +448,10 @@ async def run_room(
                 f"специалистов: {delegations}.",
                 files=files,
             )
-            return RoomOutcome("finished", summary=decision.summary,
-                               spent_usd=spent, delegations=delegations,
-                               files=files)
+            return await conclude(
+                RoomOutcome("finished", summary=decision.summary,
+                            spent_usd=spent, delegations=delegations,
+                            files=files))
 
         delegation = decision.delegation
         assert delegation is not None  # interpret() guarantees it when ok
@@ -381,10 +484,15 @@ async def run_room(
             await notify(f"Специалист {delegations} упал (rc={child.rc}). "
                          f"Дирижёр получит это в историю.")
         else:
+            # The specialist's final text, not the raw stream tail: the same
+            # T29 lesson as the conductor path. The conductor judging a
+            # delegation — and the extraction reading this history later —
+            # both want the summary the specialist wrote, not a sliced JSON
+            # event that happens to sit at the end of stdout.
             history.add(room.HistoryEntry(
                 "delegation",
                 f"specialist {delegations} returned (${child_cost:.3f})",
-                (child.output or "")[-1500:],
+                decision_text(child.output or "")[-1500:] or "no output",
             ))
 
         turn += 1

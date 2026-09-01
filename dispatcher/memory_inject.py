@@ -388,6 +388,71 @@ def write_back(*, task_id: str, target_repo: str, spec_prompt: str,
     return True
 
 
+def write_strategy_items(*, task_id: str, scope: str, source_query: str,
+                         items: "list", verdict) -> int:
+    """Append extracted strategy records — the room's write path (T30).
+
+    The pipeline's write_back composes one deterministic lesson per task; the
+    room instead runs the T26 extraction prompts over its delegation history
+    and stores each parsed item as its own record. `scope` is a literal
+    retrieval key (e.g. "room"), NOT a repository path — the ephemeral-target
+    guard does not apply because there is no path to be ephemeral; scoping by
+    a stable literal is what lets a future room's scoped recall pass find
+    room lessons at all.
+
+    Same contract as everything else in this module: degrades to 0 written on
+    any infra failure, never raises into the caller.
+    """
+    if not _strategy.strategy_enabled():
+        return 0
+    written = 0
+    for item in items:
+        try:
+            embed_text = item.embedding_text(source_query)
+            vector = _embed(embed_text)
+            if not vector:
+                continue
+            # Skip-write hygiene (T26): the top scoped hit's score IS the
+            # cosine, so one search replaces loading every stored vector.
+            near = _search(vector, 1, scope)
+            if near and float(near[0].get("score") or 0.0) >= _strategy.DUPLICATE_COSINE:
+                print(f"[memory-inject] strategy skip-write (dup >= "
+                      f"{_strategy.DUPLICATE_COSINE}): {item.title!r}",
+                      file=sys.stderr)
+                continue
+            point = {
+                "id": str(uuid.uuid4()),
+                "vector": vector,
+                "payload": {
+                    "kind": "strategy",
+                    "source": "room_writeback",
+                    "target_repo": scope,
+                    "task_id": task_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(
+                        timespec="seconds"),
+                    "text": item.content,
+                    **_strategy.payload_fields(item, verdict=verdict,
+                                               source_query=source_query),
+                },
+            }
+            if _flat.enabled():
+                if _flat.append(point):
+                    written += 1
+            else:
+                out = _post_json(
+                    f"{_env('MEMORY_QDRANT_URL', 'http://127.0.0.1:6333')}"
+                    f"/collections/{_env('MEMORY_COLLECTION', 'meta_agent_mem')}"
+                    f"/points?wait=true",
+                    {"points": [point]}, method="PUT")
+                if isinstance(out, dict) and out.get("status") == "ok":
+                    written += 1
+        except Exception as exc:  # noqa: BLE001 — memory must never raise out
+            print(f"[memory-inject] strategy write failed: {exc}", file=sys.stderr)
+    if written:
+        _retire_over_cap(scope)
+    return written
+
+
 def _retire_over_cap(target_repo: str) -> None:
     """Dilution guard: keep at most MEMORY_TARGET_CAP task_lesson points per
     target; delete the oldest beyond it. Ungated accumulation measurably

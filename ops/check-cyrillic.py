@@ -83,6 +83,7 @@ ALLOWLIST = {
     "tests/test_publish_public.py":       "builds Cyrillic fixtures to exercise this very gate",
     "tests/test_room_conductor.py":       "Russian user requests as fixtures — the language the bot is written in",
     "tests/test_room_driver.py":          "asserts the Russian room messages and carries a Russian request fixture",
+    "tests/test_room_strategy_loop.py":   "carries the same Russian request fixture for the memory-loop tests",
 }
 
 

@@ -367,8 +367,14 @@ def build_prompt(
     attempt: int,
     max_attempts: int,
     budget_left_usd: float,
+    memory_block: str = "",
 ) -> str:
-    """The conductor's whole prompt, rebuilt each turn (no chat history)."""
+    """The conductor's whole prompt, rebuilt each turn (no chat history).
+
+    ``memory_block`` is the recalled-strategies section (T30). Empty — the
+    ordinary case, and the whole prompt is byte-for-byte what it was before
+    the parameter existed; that equality is pinned by a test.
+    """
     profiles = "\n".join(
         f"  - {name}: {prof.description}" for name, prof in TOOL_PROFILES.items()
     )
@@ -379,6 +385,8 @@ def build_prompt(
     elif attempt >= max_attempts:
         budget_note += " This is your LAST attempt — finish with what you have."
 
+    memory_section = f"\nPAST STRATEGIES\n{memory_block}\n" if memory_block else ""
+
     return f"""\
 You are the Conductor of a room of specialists. You do not do the work
 yourself: you decide what needs doing, hire one specialist at a time by
@@ -386,7 +394,7 @@ describing them, and judge what comes back.
 
 REQUEST FROM THE OWNER
 {request}
-
+{memory_section}
 DECISION PROCESS
 1. READ the request and identify what would actually satisfy it.
 2. REVIEW the history below: what has been tried, what came back, what failed.

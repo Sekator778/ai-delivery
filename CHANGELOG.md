@@ -13,6 +13,16 @@ the project does not yet follow strict SemVer (pre-1.0).
 
 Entries accumulate here until the next tag.
 
+- **The room remembers (backlog/T30).** Every terminal room outcome now runs
+  the T26 strategy extraction over its delegation history — success and
+  failure branches picked by a programmatic verdict — and stores the parsed
+  items under the literal scope `room`; the next room's conductor gets the
+  relevant ones injected into its first prompt as PAST STRATEGIES. Delivery
+  always precedes memory, a memory failure is a logged zero, and either flag
+  off keeps the room byte-for-byte as it was. Specialist history entries now
+  carry the specialist's final text instead of a sliced stream tail (the T29
+  lesson applied to the remaining spot).
+
 ## [1.2.0] — 2026-09-01
 
 The milestone: DeepSeek carries every mechanical stage, the stand deploys

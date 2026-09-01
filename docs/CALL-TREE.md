@@ -171,7 +171,7 @@ Two facts here are non-obvious and load-bearing:
 |---|---|
 | `task_dispatcher.py` | file-queue daemon; polls inbox, spawns runners, owns the queue |
 | `watcher.py` | crash recovery + PR reconciliation; respawns runners |
-| `room_driver.py` | the `/room` loop (T28): conductor turn → parse → spawn specialist → repeat, with the budget debited in the provider's currency and every terminal path delivering something. Pure — spawn and notify are injected — because bot.py cannot be imported in a test |
+| `room_driver.py` | the `/room` loop (T28): conductor turn → parse → spawn specialist → repeat, with the budget debited in the provider's currency and every terminal path delivering something. Pure — spawn and notify are injected — because bot.py cannot be imported in a test. Since T30 it also closes the memory loop: recalled strategies are injected into the conductor's first prompt, and every terminal outcome runs the T26 extraction over the delegation history and stores the parsed items (scope `room`), after the chat already has its answer |
 | `strategy_memory.py` | verdict + two extraction branches + typed strategy items over the same store; embeds `source_query + description`, because retrieval matches a new request against past requests, not against lesson text (T26) |
 | `runner_liveness.py` | "is a runner alive for this task" — one definition, shared by `watcher.py` and `aidstack.sh`; matches the process cmdline, not just `kill -0`, because pidfiles outlive their processes and pids get reused |
 | `stage_runner_agent.py` | runs one task's stage sequence via `claude -p` + Agent tool |
@@ -236,7 +236,7 @@ git_pr: target_policy
 limit_stall: runner_state, telegram_io
 memory_inject: memory_flat, strategy_memory
 post_pipeline: auto_loop, runner_state
-room_driver: backend_routing, cost_ledger, room_conductor
+room_driver: backend_routing, cost_ledger, memory_inject, room_conductor, strategy_memory
 stage_runner_agent: agent_roster, architecture_lint, backend_routing, budget_gate, clarify, control_loop, cost_ledger, git_pr, invest_validator, limit_stall, memory_inject, notify_policy, post_pipeline, proc_reaper, provider_profiles, runner_state, stage_prompts, target_policy, telegram_io, triage, triage_wiring
 target_policy: project_registry
 triage_wiring: backend_routing
