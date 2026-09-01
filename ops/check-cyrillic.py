@@ -70,6 +70,7 @@ ALLOWLIST = {
     "dispatcher/control_loop.py":       "verdict wording surfaced to the operator",
     "dispatcher/auto_loop.py":          "auto-loop progress messages",
     "dispatcher/stage_runner_agent.py": "stage progress messages",
+    "dispatcher/room_driver.py":        "room progress, budget-stop and failure messages sent to Telegram",
     # Live prompt and product data, not documentation
     "meta/CLAUDE.md":                   "orchestrator prompt: Russian trigger phrases it must recognise and reply templates it sends",
     "services/stacks/voice/silero-server/README.md": "Russian TTS stress-mark examples — the syntax being documented",
@@ -81,6 +82,7 @@ ALLOWLIST = {
     "tests/test_runner_recovery.py":     "asserts the Russian recovery notice",
     "tests/test_publish_public.py":       "builds Cyrillic fixtures to exercise this very gate",
     "tests/test_room_conductor.py":       "Russian user requests as fixtures — the language the bot is written in",
+    "tests/test_room_driver.py":          "asserts the Russian room messages and carries a Russian request fixture",
 }
 
 

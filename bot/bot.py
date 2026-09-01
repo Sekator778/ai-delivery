@@ -3124,6 +3124,9 @@ def _subagent_env(backend: str = "deepseek") -> dict[str, str]:
     return env
 
 
+_ROOM_TASK_PREFIX = "room-"
+
+
 def _room_enabled() -> bool:
     """ROOM_ENABLED, read at call time so tests can flip it without reimporting."""
     from room_conductor import room_enabled  # local: dispatcher/ is on sys.path
@@ -3145,16 +3148,9 @@ async def room_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     import room_conductor as room
+    import room_driver
 
-    history = room.History()
-    prompt = room.build_prompt(
-        request=request,
-        history=history,
-        attempt=1,
-        max_attempts=room.max_delegations(),
-        budget_left_usd=room.budget_usd(),
-    )
-    task_id = f"room-{uuid.uuid4().hex[:12]}"
+    task_id = f"{room_driver.ROOM_TASK_PREFIX}{uuid.uuid4().hex[:12]}"
     # A room has no target repo: its deliverable is a document. run_subtask uses
     # `project` as the child's cwd, so it gets a scratch directory of its own.
     workdir = Path(room.scratch_root()) / task_id
@@ -3164,12 +3160,31 @@ async def room_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Комната собирается под задачу. Бюджет ${room.budget_usd():.2f}, "
         f"до {room.max_delegations()} специалистов."
     )
-    await run_subtask(
-        task_id=task_id,
-        project=str(workdir),
-        prompt=prompt,
-        new_session=True,
-        chrome=False,
+
+    async def _spawn(*, task_id: str, cwd: str, prompt: str,
+                     backend: str) -> "room_driver.SpawnResult":
+        rc, output = await run_subtask(
+            task_id=task_id, project=cwd, prompt=prompt,
+            new_session=True, chrome=False, backend=backend,
+        )
+        return room_driver.SpawnResult(rc=rc, output=output)
+
+    async def _notify(text: str, files: "list[str] | None" = None) -> None:
+        await update.message.reply_text(text[:4000])
+        for path in files or []:
+            try:
+                with open(path, "rb") as handle:
+                    await update.message.reply_document(handle)
+            except OSError as exc:
+                # A deliverable that cannot be sent is worth a line, not a
+                # crash — the summary already went out above.
+                logger.warning("room: could not send %s: %s", path, exc)
+
+    # The driver owns the loop from here; on_subtask_done recognises the room
+    # prefix and stays out of the way.
+    await room_driver.run_room(
+        request, room_id=task_id, workdir=str(workdir),
+        spawn=_spawn, notify=_notify,
     )
 
 
@@ -3181,7 +3196,15 @@ async def run_subtask(
     chrome: bool,
     root_id: str | None = None,
     backend: str = "deepseek",
-) -> None:
+) -> "tuple[int, str]":
+    """Run one sub-Claude to completion. Returns (rc, joined stdout).
+
+    The return value is additive (T28). Every existing caller either discards
+    it or wraps the coroutine in asyncio.create_task, which never inspects a
+    result — audited at the three call sites before the signature changed. The
+    room driver needs it: on_subtask_done is a notification, not a channel, so
+    without a return value a driver cannot see what its own child produced.
+    """
     args = [
         CLAUDE_BIN, "--dangerously-skip-permissions",
         "-p", prompt,
@@ -3259,6 +3282,7 @@ async def run_subtask(
             _proc_reaper.kill_group_leftovers(pgid)
         logger.info("Sub-Claude task_id=%s exited rc=%d", task_id, rc)
         await on_subtask_done(task_id, project, rc, "\n".join(output_chunks))
+    return rc, "\n".join(output_chunks)
 
 
 async def on_subtask_done(task_id: str, project: str, rc: int, output: str) -> None:
@@ -3268,6 +3292,14 @@ async def on_subtask_done(task_id: str, project: str, rc: int, output: str) -> N
             ctx.get("root_id", task_id), task_id, success=(rc == 0)
         )
     if ctx is None:
+        # A room owns its own children: the driver awaits run_subtask directly
+        # and feeds the result into the next conductor turn, so there is no
+        # meta-agent to re-enter here. Silent by design, not a swallowed
+        # warning — before T28 this branch was where the room's loop died.
+        if task_id.startswith(_ROOM_TASK_PREFIX):
+            logger.info("on_subtask_done: %s is room-owned, driver handles it",
+                        task_id)
+            return
         logger.warning("on_subtask_done: unknown task_id=%s", task_id)
         return
 

@@ -47,6 +47,33 @@ reference implementations, and cut into briefs (backlog/T25, T26).
   (strategy memory distilled from successes AND failures). Briefs cut:
   T25 (conductor MVP), T26 (strategy memory over the flat store).
 
+- **The room now drives its loop past turn one** (backlog/T28). T25 shipped the
+  conductor and no driver: on the live run it returned a valid delegation for
+  $0.178 and then nothing happened — `room_command` ended at `run_subtask` and
+  the completion callback did not know room ids, so the loop could not continue
+  by construction. `dispatcher/room_driver.py` is that loop, kept pure with
+  injected spawn/notify because bot.py cannot be imported in a test.
+  `run_subtask` now returns `(rc, output)` — additive, with all three call
+  sites audited first — because a completion callback is a notification, not a
+  channel. Budget is debited in the provider's currency via
+  `apply_backend_pricing`, and the conductor's own turns count: turn one alone
+  was 9% of the default cap. `finish` delivers the scratch files as well as the
+  summary, since "the report is ready" without the report is the same bug as
+  silence. Every terminal path — budget, turn limit, unparseable conductor,
+  failed specialist — sends something.
+- **`web-research` specialists are refused on non-web-capable models rather
+  than silently upgraded.** Server-side web search is an Anthropic API tool; on
+  a DeepSeek-compatible endpoint a research specialist has no search and
+  answers from memory instead of failing. Quietly moving it to a pricier
+  backend would make the conductor's price table a lie, so the delegation is
+  refused with the legal choice named, and the table gained a web-capable
+  column so the constraint is visible while choosing.
+- **A child cost with no token counts is no longer repriced to $0.00.** Found
+  by the driver tests before any live run: repricing computes from tokens, so a
+  result line carrying a cost but no counts booked nothing, and a room that
+  debits nothing spends without limit. It now falls back to the provider's own
+  figure under a `cli-fallback-no-tokens` label.
+
 - **Strategy memory, behind `MEMORY_STRATEGY_ENABLED` (default off)**
   (backlog/T26). Finished tasks now teach the next one: a verdict on the
   outcome, a `status`/`verdict_source`/`source_query` record, and two

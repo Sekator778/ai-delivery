@@ -69,18 +69,42 @@ def room_enabled(env: dict[str, str] | None = None) -> bool:
 # gate does not exist yet. A room that can only read and write drafts cannot
 # do damage.
 # ---------------------------------------------------------------------------
-TOOL_PROFILES: dict[str, str] = {
-    "web-research": (
+@dataclass(frozen=True)
+class ToolProfile:
+    description: str
+    # Backend the specialist MUST run on, or None for any.
+    #
+    # web-research pins anthropic because server-side web search is an
+    # Anthropic API tool: a DeepSeek-compatible endpoint does not serve it, so a
+    # web-research specialist on a DeepSeek model has no search at all. It does
+    # not fail loudly either — it just answers from what it already knows, which
+    # is the worst possible failure for a research task.
+    requires_backend: "str | None" = None
+
+
+TOOL_PROFILES: dict[str, ToolProfile] = {
+    "web-research": ToolProfile(
         "Search the open web and read pages. Use for facts about the world: "
         "prices, models, reviews, availability, how other people solved this. "
-        "Read-only."
+        "Read-only. Runs only on the models marked web-capable in the table "
+        "below — real search is not available on the cheaper ones.",
+        requires_backend="anthropic",
     ),
-    "documents": (
+    "documents": ToolProfile(
         "Create and edit files in the task scratch directory and hand them back "
         "to the chat. Use for the deliverable itself: a report, a shortlist, a "
-        "checklist, a plan. No sending anywhere."
+        "checklist, a plan. No sending anywhere. Runs on any model.",
     ),
 }
+
+
+def models_for_profile(profile: str) -> "list[str]":
+    """Masked names a profile may legally use, cheapest first."""
+    required = TOOL_PROFILES[profile].requires_backend
+    return [
+        mask for mask, opt in masked_models().items()
+        if required is None or opt.backend == required
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -117,10 +141,19 @@ def masked_models() -> dict[str, ModelOption]:
 
 
 def pricing_table() -> str:
-    """Markdown price table for the prompt, masked names only."""
-    rows = ["| name | price / Mtok | notes |", "|---|---|---|"]
+    """Markdown price table for the prompt, masked names only.
+
+    The web-capable column is not decoration: picking a cheap model for a
+    web-research specialist is refused, so the conductor needs to see the
+    constraint while it is choosing rather than discover it in a rejection.
+    """
+    web = set(models_for_profile("web-research"))
+    rows = ["| name | price / Mtok | web-capable | notes |", "|---|---|---|---|"]
     for mask, opt in masked_models().items():
-        rows.append(f"| {mask} | ${opt.price_per_mtok:.2f} | {opt.strength_hint} |")
+        rows.append(
+            f"| {mask} | ${opt.price_per_mtok:.2f} | "
+            f"{'yes' if mask in web else 'no'} | {opt.strength_hint} |"
+        )
     return "\n".join(rows)
 
 
@@ -171,6 +204,18 @@ class Delegation:
         if profile not in TOOL_PROFILES:
             raise DelegationError(
                 f"tools_profile {profile!r} is not one of {', '.join(TOOL_PROFILES)}"
+            )
+
+        # Profile/model compatibility. Refused rather than silently upgraded:
+        # quietly moving a web-research specialist onto a pricier backend would
+        # make the price table a lie, and the whole reason for masking names is
+        # that the conductor reasons about real cost. A refusal goes into the
+        # history like any other turn, so the re-pick is informed.
+        legal = models_for_profile(profile)
+        if model not in legal:
+            raise DelegationError(
+                f"tools_profile {profile!r} cannot run on {model} — real web "
+                f"search is not available there. Use one of: {', '.join(legal)}"
             )
 
         return cls(
@@ -324,7 +369,9 @@ def build_prompt(
     budget_left_usd: float,
 ) -> str:
     """The conductor's whole prompt, rebuilt each turn (no chat history)."""
-    profiles = "\n".join(f"  - {name}: {desc}" for name, desc in TOOL_PROFILES.items())
+    profiles = "\n".join(
+        f"  - {name}: {prof.description}" for name, prof in TOOL_PROFILES.items()
+    )
 
     budget_note = f"Budget left for this room: ${budget_left_usd:.2f}."
     if budget_left_usd <= 0:
