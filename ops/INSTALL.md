@@ -118,7 +118,7 @@ node --version && npm --version
 
 ## Step 4b — GitHub CLI (`gh`) — required for PR operations
 
-The Reviewer stage opens the PR and the `[Да]` approval merges it, both via `gh`.
+The Reviewer stage opens the PR and the approve button merges it, both via `gh`.
 Without an authenticated `gh`, the pipeline reaches the Reviewer and then fails at
 the PR step. Install and authenticate:
 

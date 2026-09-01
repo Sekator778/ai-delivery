@@ -794,6 +794,110 @@ class TestSelfCheck(unittest.TestCase):
 
 
 
+class TestEnglishOnlyGate(unittest.TestCase):
+    """T27: public artifacts are English; layer 3 enforces CLAUDE.md §2.
+
+    The policy predates this gate — Russian reached the public mirror on the
+    first resumed publish precisely because nothing checked.
+    """
+
+    def setUp(self) -> None:
+        self.src, self.mirror, self.tmp = _make_fixture()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _commit(self, rel: str, text: str) -> None:
+        path = self.src / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        _git(self.src, "add", rel)
+        _git(self.src, "commit", "-m", f"add {rel}")
+
+    def test_cyrillic_in_a_new_public_file_blocks_the_publish(self) -> None:
+        self._commit("docs/notes-ru.md", "# Notes\n\nЭто русский текст.\n")
+
+        result = _run(self.src, self.mirror)
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 3,
+                         f"Expected exit 3 (gate finding).\n{combined}")
+        self.assertIn("english-only", combined)
+        self.assertIn("docs/notes-ru.md", combined,
+                      "the refusal must name the offending file")
+
+    def test_the_refusal_names_the_offending_line(self) -> None:
+        self._commit("docs/notes-ru.md", "ok\nвторая строка русская\n")
+        result = _run(self.src, self.mirror)
+        combined = result.stdout + result.stderr
+        self.assertIn("2:", combined, "the line number must be reported")
+
+    def test_nothing_to_publish_when_the_export_is_english(self) -> None:
+        """Regression guard: the gate must not fire on the ordinary fixture."""
+        result = _run(self.src, self.mirror)
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, combined)
+        self.assertIn("layer 3 clean", combined)
+
+    def test_a_binary_file_does_not_trip_the_gate(self) -> None:
+        """docs/demo.gif matched a byte-level scan; a PNG must not block a publish."""
+        png = self.src / "docs" / "pixel.png"
+        png.parent.mkdir(parents=True, exist_ok=True)
+        # Bytes that are not valid UTF-8, including some in the Cyrillic range.
+        png.write_bytes(b"\x89PNG\r\n\x1a\n\xff\xd0\xb0\xff\xfe")
+        _git(self.src, "add", "docs/pixel.png")
+        _git(self.src, "commit", "-m", "add binary")
+
+        result = _run(self.src, self.mirror)
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0,
+                         f"A binary file must not be read as Cyrillic prose.\n{combined}")
+
+    def test_an_allowlisted_file_keeps_its_russian(self) -> None:
+        """Telegram-facing product text is Russian by product decision (§2)."""
+        self._commit("bot/bot.py", "# bot\nTEXT = 'Задача принята'\n")
+
+        result = _run(self.src, self.mirror)
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0,
+                         f"bot/bot.py is allowlisted; it must publish.\n{combined}")
+
+    def test_every_allowlist_entry_carries_a_reason(self) -> None:
+        """An entry without a justification is how an allowlist becomes a mute button."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "check_cyrillic", REPO_ROOT / "ops" / "check-cyrillic.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        self.assertTrue(mod.ALLOWLIST, "the allowlist must not be empty")
+        for path, reason in mod.ALLOWLIST.items():
+            self.assertTrue(reason and len(reason) > 10,
+                            f"{path} has no usable reason: {reason!r}")
+
+    def test_the_scanner_is_unicode_aware_not_byte_oriented(self) -> None:
+        """`grep -P` without a UTF-8 locale flags em dashes, CJK and emoji.
+
+        This repository's prose is full of em dashes, so a byte-oriented scan
+        would have been red on almost every file — and macOS grep has no -P at
+        all, which is where this script actually runs.
+        """
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "check_cyrillic", REPO_ROOT / "ops" / "check-cyrillic.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        probe = self.src / "probe.md"
+        probe.write_text("em dash — here\nChinese 中文\nemoji \U0001F680\n",
+                         encoding="utf-8")
+        self.assertEqual(mod.scan_file(probe, "probe.md"), [],
+                         "non-Cyrillic non-ASCII must not be flagged")
+
+        probe.write_text("ascii\nрусский\n", encoding="utf-8")
+        hits = mod.scan_file(probe, "probe.md")
+        self.assertEqual([n for n, _ in hits], [2])
+
+
 class TestRefFreshness(unittest.TestCase):
     """T23: the source ref must be what origin says the branch is.
 

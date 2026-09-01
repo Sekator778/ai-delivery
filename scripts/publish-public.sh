@@ -25,7 +25,8 @@
 #   1  usage error
 #   2  preflight failure (bad ref, stale/diverged ref, missing gitleaks,
 #      missing blocklist, no reachable tag, unauthorized --push)
-#   3  gate finding (secrets or PII detected in export or commit message)
+#   3  gate finding (secrets or PII in the export or commit message, or
+#      Cyrillic in a public artifact outside the allowlist)
 #   4  push/verification failure
 #
 # Usage:
@@ -53,6 +54,18 @@ set -euo pipefail
 # PUBLISH_REPO_ROOT is a non-safety override used only by tests; it lets the
 # test suite point the script at a throwaway fixture repo (ADR-010).
 # ---------------------------------------------------------------------------
+# Where this script itself lives — resolved BEFORE the cd below, because
+# ${BASH_SOURCE[0]} may be a relative path and --self-check re-invokes the
+# script with the working directory already moved into a fixture.
+#
+# Used only for the layer-3 scanner (T27), which is part of the tooling that
+# runs rather than of the tree being exported. REPO_ROOT is overridable via
+# PUBLISH_REPO_ROOT so the tests and --self-check can aim the script at a
+# throwaway fixture; looking for the scanner in there would break both.
+SCRIPT_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly SCRIPT_HOME
+readonly CYRILLIC_SCANNER="$SCRIPT_HOME/ops/check-cyrillic.py"
+
 if [[ -n "${PUBLISH_REPO_ROOT:-}" ]]; then
   REPO_ROOT="$PUBLISH_REPO_ROOT"
 else
@@ -148,6 +161,10 @@ readonly EXCLUDE_FILES=(bot/projects.json CLAUDE.md ops/leak-watch.py .gitleaksi
 # tasks/ keep list: anything else under tasks/ is excluded
 readonly TASKS_KEEP_PATTERN="tasks/_TEMPLATE"
 readonly BLOCKLIST_FILE="$REPO_ROOT/ops/publish-blocklist.local"
+
+# Interpreter for the layer-3 scanner, resolved once so preflight can fail on a
+# missing interpreter rather than the gate failing halfway through an export.
+PYTHON_BIN="$(command -v python3 || true)"
 
 # The remote the SOURCE ref is checked against for freshness (T23).
 # Deliberately NOT env-overridable, unlike PUBLISH_REMOTE: pointing this at a
@@ -412,6 +429,17 @@ preflight() {
     die "ops/publish-blocklist.local not found.
   Create it from the template and fill in your project-specific patterns:
     cp ops/publish-blocklist.local.example ops/publish-blocklist.local" 2
+  fi
+
+  # Layer-3 scanner prerequisites (T27): the interpreter and the script itself.
+  # Checked here, with the other cheap local checks, so a missing dependency is
+  # reported before an export is built rather than after.
+  if [[ -z "$PYTHON_BIN" ]]; then
+    die "python3 not found on PATH — required by the english-only gate
+  (ops/check-cyrillic.py)." 2
+  fi
+  if [[ ! -f "$CYRILLIC_SCANNER" ]]; then
+    die "$CYRILLIC_SCANNER not found — the english-only gate cannot run." 2
   fi
 
   # Reachable version tag (FR-014)
@@ -743,6 +771,33 @@ run_gate() {
     die "Layer 2 (blocklist) found $bl_findings hit(s) — publish blocked." 3
   fi
   ok "gate: layer 2 clean"
+
+  # Layer 3: Cyrillic outside the allowlist (T27).
+  #
+  # CLAUDE.md §2 has always required English for public-facing artifacts, and
+  # nothing enforced it — which is how Russian reached the mirror on the first
+  # resumed publish (2026-09-01). Layers 1 and 2 look for secrets and PII;
+  # neither has an opinion about language.
+  #
+  # Delegated to ops/check-cyrillic.py rather than written inline, and that is
+  # not a style choice. A `grep -P` over a Cyrillic character class is
+  # byte-oriented unless the locale says otherwise, so with LANG unset the
+  # class becomes a byte range matching every non-ASCII character — em dashes
+  # included, and this repository's prose is full of them. It also cannot run
+  # here at all: this script's home is the operator's macOS machine, where grep
+  # is BSD grep with no -P and no C.UTF-8 to force. Python decodes first, so
+  # the class means code points, on both platforms.
+  step "gate: layer 3 (english-only)"
+  local cyr_status=0
+  "$PYTHON_BIN" "$CYRILLIC_SCANNER" "$EXPORT" || cyr_status=$?
+  if [[ "$cyr_status" -eq 2 ]]; then
+    die "Layer 3 (english-only) found Cyrillic outside the allowlist — publish blocked." 3
+  fi
+  if [[ "$cyr_status" -ne 0 ]]; then
+    # A scanner that cannot run is not a scanner that passed.
+    die "Layer 3 (english-only) could not run (exit $cyr_status) — publish blocked." 3
+  fi
+  ok "gate: layer 3 clean"
 }
 
 # ---------------------------------------------------------------------------

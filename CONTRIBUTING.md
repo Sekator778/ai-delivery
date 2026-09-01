@@ -28,9 +28,9 @@ You (Telegram)                ai-delivery bot                    target repo
    │                                │   Tester ‖ Security            │
    │                                │   ↓                            │
    │                                │   Reviewer                     │
-   │                                ├─ APPROVE? → Telegram [Да/Нет]  │
+   │                                ├─ APPROVE? → Telegram approve? │
    │                                │                                │
-   ├─ tap [Да] ──────────────────→  │                                │
+   ├─ tap approve ───────────────→  │                                │
    │                                ├─ gh pr merge --squash  ────────┼─→ merged
    │                                ├─ updates memory-bank in target │
    │                                ├─ moves task to tasks/done/     │
@@ -247,7 +247,7 @@ tasks/                  task lifecycle directories
   active/                    being processed by a stage_runner
   awaiting-approval/         Reviewer APPROVE'd; Telegram inline keyboard pending
   awaiting-input/            escalated (iteration cap, watchdog, cost cap, stagnation)
-  done/                      after the user tapped Да
+  done/                      after the user tapped approve
   failed/                    terminal failure
 ```
 
@@ -370,8 +370,8 @@ worth returning to. Checklist: [ops/RELEASE.md](ops/RELEASE.md).
 
 1. `/task @<alias> <text>` in Telegram
 2. Watch the stage updates (one Telegram message per stage start + completion + cost)
-3. Wait for `✓ APPROVE. PR: ... [Да] [Нет]` (or escalation menu if it stalled)
-4. Tap [Да] → automatic merge + memory-bank auto-update + task moves to done/
+3. Wait for `✓ APPROVE. PR: ...` with the approve/decline buttons (or the escalation menu if it stalled)
+4. Tap approve → automatic merge + memory-bank auto-update + task moves to done/
 
 If the task escalates to awaiting-input/, read the worklog and `06-review.md`, decide whether to retry / hotfix manually / abandon.
 

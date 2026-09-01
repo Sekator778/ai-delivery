@@ -71,7 +71,7 @@ STAGE_CANONICAL_ARTIFACT = {
     "reviewer":  "06-review.md",
 }
 
-# ── WS-4b alias-staging (Фаза 1): additive specs/ folder mirror ──
+# ── WS-4b alias-staging (Phase 1): additive specs/ folder mirror ──
 # Maps the three pipeline artifacts that correspond to Spec-Kit's documented
 # folder filenames. Used ONLY by _mirror_to_specs_folder (opt-in, default OFF).
 # Names are the vendored spec-kit/ filenames (spec.md/plan.md/tasks.md) — not
@@ -79,7 +79,7 @@ STAGE_CANONICAL_ARTIFACT = {
 # an open committee question (STATE/WS-4b-IMPACT-2026-05-29.md §5), and a
 # default-OFF additive mirror keeps the layout provisional/overridable. The flat
 # canonical names above stay primary; nothing reads the mirror yet (the read
-# flip is Фаза 2, gated on Phase D / subprocess retirement).
+# flip is Phase 2, gated on Phase D / subprocess retirement).
 SPECS_FOLDER_SEMANTIC = {
     "ba":        "spec.md",    # Spec-Kit /specify
     "architect": "plan.md",    # Spec-Kit /plan

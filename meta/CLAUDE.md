@@ -288,11 +288,11 @@ cross-task semantic recall. Layer 3 is for cross-host user-level facts.
 plain text by default; if you want emphasis, use these HTML tags only —
 nothing else is supported:
 
-- `<b>жирный</b>` for bold
-- `<i>курсив</i>` for italic
+- `<b>bold</b>` for bold
+- `<i>italic</i>` for italic
 - `<code>inline-code</code>` for inline code
 - `<pre>multi-line\ncode</pre>` for code blocks
-- `<a href="URL">текст</a>` for links
+- `<a href="URL">text</a>` for links
 
 **Do NOT use Markdown** (`**bold**`, `*italic*`, `` `code` `` with backticks)
 — `botctl-send-text` auto-converts common Markdown to HTML before sending,

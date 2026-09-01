@@ -110,7 +110,7 @@ rejected silently. Key inputs:
 | `/projects` | List registered project aliases |
 | `/usage [today\|week\|all]` | Cost report from `tasks/*/state.json` — per-stage + per-backend |
 | `/tasks`, `/requeue <id> [guidance]` | List parked tasks; resume a handed-off one from chat |
-| `[Да]/[Нет]` after Reviewer APPROVE | Merge the PR (`gh pr merge --squash`) → `done/`, or leave it |
+| approve / decline buttons after Reviewer APPROVE | Merge the PR (`gh pr merge --squash`) → `done/`, or leave it |
 
 Safety: a target repo produces a real, mergeable PR **only** if it's explicitly
 allowlisted (`MERGEABLE_REPO_PATHS`); every other target stays in PoC mode

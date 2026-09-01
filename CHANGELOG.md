@@ -47,6 +47,23 @@ reference implementations, and cut into briefs (backlog/T25, T26).
   (strategy memory distilled from successes AND failures). Briefs cut:
   T25 (conductor MVP), T26 (strategy memory over the flat store).
 
+- **Public artifacts are English, and a gate now enforces it** (backlog/T27).
+  CLAUDE.md §2 always required it; nothing checked, so Russian reached the
+  public mirror on the first resumed publish. `publish-public.sh` gained a
+  third gate layer — `ops/check-cyrillic.py` over the export, fail-closed,
+  exit 3 — with a file allowlist where every entry states which Telegram-facing
+  text it carries. The sweep left 0 violations across the 275 published files.
+  Not a `grep -P` over a Cyrillic character class: PCRE is byte-oriented
+  without a UTF-8 locale, so the class matches every non-ASCII character (em
+  dashes, CJK, emoji — 379 false hits against 211 real ones in one file), and
+  macOS grep, which is what runs on the operator's machine, has no `-P` at all. Files that do not decode
+  as UTF-8 are skipped, so adding a PNG to the export cannot block a publish.
+- **Two files reclassified as product surface, not documentation slips.**
+  `meta/CLAUDE.md` is the orchestrator's live prompt — its Russian is trigger
+  phrases it must recognise and reply templates it sends — and the silero
+  README documents Russian stress-mark syntax by example. Translating either
+  would have changed behaviour or destroyed the example.
+
 - **CI: shellcheck is a blocking gate, and gitleaks now scans the whole
   history.** Both were deliberate omissions waiting on a triage that has now
   been done. shellcheck runs at `severity=warning` over every tracked script
@@ -793,7 +810,7 @@ reference implementations, and cut into briefs (backlog/T25, T26).
   `{target_repo}/CLAUDE.md` and `{target_repo}/AGENTS.md` explicitly, with the
   reason travelling alongside the instruction so a later edit does not drop it
   as redundant. `research/topics/C_context.md` had already rated these files
-  "обязательный фундамент"; the pipeline was the one place not using them.
+  "a mandatory foundation"; the pipeline was the one place not using them.
   Moving `cwd` into the target worktree is the cleaner fix and is blocked on
   installing the personas at user level — the current `cwd` is what makes
   `.claude/agents/` resolvable.

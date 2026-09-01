@@ -1,26 +1,26 @@
-# Конвейер AI Delivery — OpenFlow-флоу для Windmill (дирижёр 4.2).
+# AI Delivery pipeline — OpenFlow flow for Windmill (conductor 4.2).
 #
-# Стадии — inline bash rawscript в STUB-режиме: возвращают заготовленный артефакт
-# (в ./result.json) вместо вызова `claude`. Реальный харнес-вызов подключается на
-# пилоте (Max-подписка) в месте, помеченном "РЕАЛЬНЫЙ режим" в каждой стадии.
+# Stages are inline bash rawscripts in STUB mode: they return a canned artifact
+# (in ./result.json) instead of calling `claude`. The real harness call is wired in
+# during the pilot (Max subscription) at the spot marked "REAL mode" in each stage.
 #
-# Деплой:  wmill flow push windmill/flows/ai-delivery-pipeline.flow \
+# Deploy:  wmill flow push windmill/flows/ai-delivery-pipeline.flow \
 #            f/ai_delivery/pipeline --workspace ai-delivery --base-url http://localhost/ --token <TOKEN>
 #
-# Конвенции Windmill, учтённые после первого прогона:
-#  - каждый параметр bash — на ОТДЕЛЬНОЙ строке (X="$N"), иначе не парсится;
-#  - результат стадии писать в ./result.json — тогда это объект, и ветки читают
-#    results.<id>.<field>; echo в stdout даёт строку, доступ к полю не работает.
-summary: AI Delivery — конвейер доставки
+# Windmill conventions learned on the first run:
+#  - every bash parameter goes on its OWN line (X="$N"), or it will not parse;
+#  - write the stage result to ./result.json — then it is an object and branches read
+#    results.<id>.<field>; echo to stdout yields a string and field access fails.
+summary: AI Delivery — delivery pipeline
 description: >-
-  Дирижёр конвейера: triage -> spec -> plan -> test_design -> implement -> gate,
-  далее ветка по вердикту гейта (fail -> доработка; pass -> ручной аппрув -> prod).
-  STUB-режим — проверка плюмбинга дирижёра без ключей.
+  Pipeline conductor: triage -> spec -> plan -> test_design -> implement -> gate,
+  then a branch on the gate verdict (fail -> rework; pass -> manual approval -> prod).
+  STUB mode checks the conductor's plumbing without any API keys.
 value:
   same_worker: false
   modules:
     - id: triage
-      summary: Триаж задачи
+      summary: Task triage
       value:
         type: rawscript
         language: bash
@@ -31,10 +31,10 @@ value:
           task_id="$1"
           mode="${2:-stub}"
           >&2 echo "[triage] task=$task_id mode=$mode"
-          # РЕАЛЬНЫЙ режим: claude -p со скиллом skills/spec (быстрый вердикт)
+          # REAL mode: claude -p with the skills/spec skill (fast verdict)
           echo '{"stage":"triage","verdict":"ok","estimate":"S"}' > result.json
     - id: spec
-      summary: Спецификация
+      summary: Specification
       value:
         type: rawscript
         language: bash
@@ -45,10 +45,10 @@ value:
           task_id="$1"
           mode="${2:-stub}"
           >&2 echo "[spec] task=$task_id mode=$mode"
-          # РЕАЛЬНЫЙ режим: claude -p со скиллом skills/spec (модель: Opus)
+          # REAL mode: claude -p with the skills/spec skill (model: Opus)
           echo '{"stage":"spec","artifact":"spec.md","status":"done"}' > result.json
     - id: plan
-      summary: План реализации
+      summary: Implementation plan
       value:
         type: rawscript
         language: bash
@@ -59,10 +59,10 @@ value:
           task_id="$1"
           mode="${2:-stub}"
           >&2 echo "[plan] task=$task_id mode=$mode"
-          # РЕАЛЬНЫЙ режим: claude -p со скиллом skills/plan, plan mode (модель: Opus)
+          # REAL mode: claude -p with the skills/plan skill, plan mode (model: Opus)
           echo '{"stage":"plan","artifact":"plan.md","status":"done"}' > result.json
     - id: test_design
-      summary: Тесты-контракт
+      summary: Contract tests
       value:
         type: rawscript
         language: bash
@@ -73,10 +73,10 @@ value:
           task_id="$1"
           mode="${2:-stub}"
           >&2 echo "[test_design] task=$task_id mode=$mode"
-          # РЕАЛЬНЫЙ режим: claude -p со скиллом skills/test-design (модель-ревьюер)
+          # REAL mode: claude -p with the skills/test-design skill (reviewer model)
           echo '{"stage":"test_design","artifact":"src/test","status":"done"}' > result.json
     - id: implement
-      summary: Реализация
+      summary: Implementation
       value:
         type: rawscript
         language: bash
@@ -87,10 +87,10 @@ value:
           task_id="$1"
           mode="${2:-stub}"
           >&2 echo "[implement] task=$task_id mode=$mode"
-          # РЕАЛЬНЫЙ режим: claude -p со скиллом skills/implement (китайская coding-модель)
+          # REAL mode: claude -p with the skills/implement skill (Chinese coding model)
           echo '{"stage":"implement","artifact":"src/main","status":"done"}' > result.json
     - id: gate
-      summary: Гейт качества
+      summary: Quality gate
       value:
         type: rawscript
         language: bash
@@ -101,28 +101,28 @@ value:
           task_id="$1"
           gate_outcome="${2:-pass}"
           >&2 echo "[gate] task=$task_id verdict=$gate_outcome"
-          # РЕАЛЬНЫЙ режим: mvn verify (тесты+JaCoCo+SpotBugs+Checkstyle) + cross-model ревью
+          # REAL mode: mvn verify (tests+JaCoCo+SpotBugs+Checkstyle) + cross-model review
           echo "{\"stage\":\"gate\",\"verdict\":\"$gate_outcome\"}" > result.json
     - id: gate_branch
-      summary: Ветка по вердикту гейта
+      summary: Branch on the gate verdict
       value:
         type: branchone
         branches:
-          - summary: gate fail — доработка
+          - summary: gate fail — rework
             expr: 'results.gate.verdict != "pass"'
             modules:
               - id: rework
-                summary: Доработка
+                summary: Rework
                 value:
                   type: rawscript
                   language: bash
                   input_transforms: {}
                   content: |
-                    >&2 echo "[rework] гейт не пройден — возврат в test_design (в пилоте: отметка)"
+                    >&2 echo "[rework] gate not passed — back to test_design (pilot: mark only)"
                     echo '{"stage":"rework","status":"needs_rework"}' > result.json
         default:
           - id: approval
-            summary: Ручной аппрув перед prod
+            summary: Manual approval before prod
             suspend:
               required_events: 1
               timeout: 86400
@@ -131,16 +131,16 @@ value:
               language: bash
               input_transforms: {}
               content: |
-                >&2 echo "[approval] ожидание ручного аппрува (Windmill suspend)"
+                >&2 echo "[approval] waiting for manual approval (Windmill suspend)"
                 echo '{"stage":"approval","status":"approved"}' > result.json
           - id: prod
-            summary: Выкатка в prod
+            summary: Deploy to prod
             value:
               type: rawscript
               language: bash
               input_transforms: {}
               content: |
-                >&2 echo "[prod] выкатка в prod (stub)"
+                >&2 echo "[prod] deploy to prod (stub)"
                 echo '{"stage":"prod","status":"deployed"}' > result.json
 schema:
   $schema: https://json-schema.org/draft/2020-12/schema
@@ -148,17 +148,17 @@ schema:
   properties:
     task_id:
       type: string
-      description: ID задачи
+      description: Task ID
     task_text:
       type: string
-      description: Текст бизнес-задачи
+      description: Business task text
     mode:
       type: string
       description: stub | real
       default: stub
     gate_outcome:
       type: string
-      description: 'STUB: вердикт гейта для проверки веток (pass|fail)'
+      description: 'STUB: gate verdict for exercising the branches (pass|fail)'
       default: pass
   required:
     - task_id

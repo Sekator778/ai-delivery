@@ -69,10 +69,10 @@ Reply in chat. The bot writes your answer back to the task and resumes the pipel
 ### When Reviewer approves the PR
 
 ```
-[Да]  [Нет]
+[ approve ]  [ decline ]
 ```
 
-Inline keyboard appears with the PR URL. Tap `Да` → bot runs `gh pr merge --squash`, moves the task to `done/`. Tap `Нет` → task stays in `awaiting-approval/` for manual handling.
+Inline keyboard appears with the PR URL. Tap approve → bot runs `gh pr merge --squash`, moves the task to `done/`. Tap decline → task stays in `awaiting-approval/` for manual handling. (The Telegram UI itself is localized in Russian — these two buttons are the approve/decline pair.)
 
 ---
 
