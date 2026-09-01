@@ -80,6 +80,7 @@ ALLOWLIST = {
     "tests/test_stt_utils.py":           "asserts Russian speech-to-text fixtures",
     "tests/test_runner_recovery.py":     "asserts the Russian recovery notice",
     "tests/test_publish_public.py":       "builds Cyrillic fixtures to exercise this very gate",
+    "tests/test_room_conductor.py":       "Russian user requests as fixtures — the language the bot is written in",
 }
 
 

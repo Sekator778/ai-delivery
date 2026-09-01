@@ -123,7 +123,10 @@ stage_runner_agent.py <task_dir>          runs the stage sequence for ONE task
 │  │                        ba/architect/developer (TEI :8087 embed + Qdrant :6333
 │  │                        search, stdlib HTTP — or memory_flat.py's JSONL store
 │  │                        with MEMORY_FLAT_ENABLED=1, T13); typed task_lesson
-│  │                        write-back at pipeline completion; degrades to
+│  │                        write-back at pipeline completion — carrying a
+│  │                        verdict and embedding the source REQUEST rather than
+│  │                        the lesson under MEMORY_STRATEGY_ENABLED=1
+│  │                        (strategy_memory.py, T26); degrades to
 │  │                        "(none)" — a stage never blocks on memory infra
 │  │                        (replaces the dead UserPromptSubmit hook path)
 │  ├─ proc_reaper.spawn ["claude", --dangerously-skip-permissions,
@@ -168,6 +171,7 @@ Two facts here are non-obvious and load-bearing:
 |---|---|
 | `task_dispatcher.py` | file-queue daemon; polls inbox, spawns runners, owns the queue |
 | `watcher.py` | crash recovery + PR reconciliation; respawns runners |
+| `strategy_memory.py` | verdict + two extraction branches + typed strategy items over the same store; embeds `source_query + description`, because retrieval matches a new request against past requests, not against lesson text (T26) |
 | `runner_liveness.py` | "is a runner alive for this task" — one definition, shared by `watcher.py` and `aidstack.sh`; matches the process cmdline, not just `kill -0`, because pidfiles outlive their processes and pids get reused |
 | `stage_runner_agent.py` | runs one task's stage sequence via `claude -p` + Agent tool |
 | `stage_prompts.py` | stage data: prompts, artifact names, done-markers (god-module split 2026-06-04) |
@@ -229,7 +233,7 @@ budget_gate: telegram_io
 control_loop: stage_prompts
 git_pr: target_policy
 limit_stall: runner_state, telegram_io
-memory_inject: memory_flat
+memory_inject: memory_flat, strategy_memory
 post_pipeline: auto_loop, runner_state
 stage_runner_agent: agent_roster, architecture_lint, backend_routing, budget_gate, clarify, control_loop, cost_ledger, git_pr, invest_validator, limit_stall, memory_inject, notify_policy, post_pipeline, proc_reaper, provider_profiles, runner_state, stage_prompts, target_policy, telegram_io, triage, triage_wiring
 target_policy: project_registry

@@ -61,7 +61,8 @@ _ENTRY_CHAR_CAP = 700     # per recalled record
 _BLOCK_CHAR_CAP = 4000    # whole injected block — protect the context budget
 
 
-import memory_flat as _flat  # noqa: E402  (flat store, T13 — opt-in)
+import memory_flat as _flat        # noqa: E402  (flat store, T13 — opt-in)
+import strategy_memory as _strategy  # noqa: E402  (strategy fields, T26 — opt-in)
 
 
 def _env(name: str, default: str) -> str:
@@ -332,7 +333,28 @@ def write_back(*, task_id: str, target_repo: str, spec_prompt: str,
         f"pr={state.get('pr_url') or '-'}). Request: "
         + " ".join((spec_prompt or "").split())[:400]
     )
-    vector = _embed(text)
+    # Strategy fields (T26), additive and behind MEMORY_STRATEGY_ENABLED.
+    #
+    # Off: `extra` stays empty, the embedded text is the summary exactly as
+    # before, and the payload has the keys it has always had. On: the record
+    # also carries the verdict, and — the part that matters — the embedding
+    # becomes source_query + description rather than the summary, because
+    # retrieval matches a new request against past requests. See
+    # dispatcher/strategy_memory.py for why that is the whole point of the port.
+    extra: dict = {}
+    embed_text = text
+    if _strategy.strategy_enabled():
+        verdict = _strategy.verdict_from_signal(stop_reason, state)
+        if verdict is not None:
+            request = " ".join((spec_prompt or "").split())[:400]
+            extra = {
+                "status": verdict.status,
+                "verdict_source": verdict.source,
+                "source_query": request,
+            }
+            embed_text = f"{request}\n{text}"
+
+    vector = _embed(embed_text)
     if not vector:
         return False
     point = {
@@ -348,6 +370,7 @@ def write_back(*, task_id: str, target_repo: str, spec_prompt: str,
             "pr_url": state.get("pr_url") or "",
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "text": text,
+            **extra,
         },
     }
     if _flat.enabled():

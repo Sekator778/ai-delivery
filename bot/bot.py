@@ -1767,6 +1767,10 @@ async def _publish_bot_commands(bot) -> None:
         BotCommand("help",     "Полная справка"),
         BotCommand("start",    "Показать клавиатуру"),
     ]
+    # Same gate as the handler: with ROOM_ENABLED off the command is not
+    # advertised either, so the menu a user sees is unchanged.
+    if _room_enabled():
+        commands.insert(1, BotCommand("room", "Комната специалистов: /room запрос"))
     try:
         await bot.set_my_commands(commands)
         logger.info("Telegram /-menu: registered %d commands", len(commands))
@@ -3120,6 +3124,55 @@ def _subagent_env(backend: str = "deepseek") -> dict[str, str]:
     return env
 
 
+def _room_enabled() -> bool:
+    """ROOM_ENABLED, read at call time so tests can flip it without reimporting."""
+    from room_conductor import room_enabled  # local: dispatcher/ is on sys.path
+    return room_enabled()
+
+
+async def room_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/room <request> — hand a free-form task to the conductor.
+
+    MVP surface, deliberately narrow: an explicit command only. No interception
+    of ordinary messages — that is a router on top of this, and it belongs after
+    the conductor has been watched working.
+    """
+    request = " ".join(context.args or []).strip()
+    if not request:
+        await update.message.reply_text(
+            "Опишите задачу: /room подобрать подержанный автомобиль до 15к"
+        )
+        return
+
+    import room_conductor as room
+
+    history = room.History()
+    prompt = room.build_prompt(
+        request=request,
+        history=history,
+        attempt=1,
+        max_attempts=room.max_delegations(),
+        budget_left_usd=room.budget_usd(),
+    )
+    task_id = f"room-{uuid.uuid4().hex[:12]}"
+    # A room has no target repo: its deliverable is a document. run_subtask uses
+    # `project` as the child's cwd, so it gets a scratch directory of its own.
+    workdir = Path(room.scratch_root()) / task_id
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    await update.message.reply_text(
+        f"Комната собирается под задачу. Бюджет ${room.budget_usd():.2f}, "
+        f"до {room.max_delegations()} специалистов."
+    )
+    await run_subtask(
+        task_id=task_id,
+        project=str(workdir),
+        prompt=prompt,
+        new_session=True,
+        chrome=False,
+    )
+
+
 async def run_subtask(
     task_id: str,
     project: str,
@@ -3624,6 +3677,14 @@ async def run_all() -> None:
     app.add_handler(CommandHandler("tasks", tasks_command))
     app.add_handler(CommandHandler("requeue", requeue_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    # /room — the conductor (T25), behind ROOM_ENABLED and OFF by default.
+    #
+    # The handler is not registered at all when the flag is off, rather than
+    # registered and refusing: an unregistered command falls through to the
+    # existing unknown-command path, so a bot without the flag behaves exactly
+    # as it did before this change. tests/test_room_conductor.py pins that.
+    if _room_enabled():
+        app.add_handler(CommandHandler("room", room_command))
     # block=False on the meta-agent entry points: the application processes
     # updates sequentially, so a long meta run used to freeze the whole update
     # queue — /cancel included (#8). meta_lock still serializes the runs

@@ -47,6 +47,41 @@ reference implementations, and cut into briefs (backlog/T25, T26).
   (strategy memory distilled from successes AND failures). Briefs cut:
   T25 (conductor MVP), T26 (strategy memory over the flat store).
 
+- **Strategy memory, behind `MEMORY_STRATEGY_ENABLED` (default off)**
+  (backlog/T26). Finished tasks now teach the next one: a verdict on the
+  outcome, a `status`/`verdict_source`/`source_query` record, and two
+  extraction branches so failures produce recovery procedures rather than
+  nothing. Ported from ReasoningBank read as code.
+  The load-bearing detail is counter-intuitive and only visible in that code:
+  retrieval matches a new request against past *requests*, so the embedded text
+  is `source_query + description`, not the lesson. Embedding the lesson — the
+  obvious choice — means a good strategy from a differently-worded task is
+  never retrieved.
+  Verdicts prefer the programmatic signal the pipeline already has; the LLM
+  judge is a fallback and uses the WebArena prompt with its strictness rules,
+  not the SWE-bench one whose `"success" in reply` test reads "this was not a
+  success" as a success. Items are parsed into typed fields and dropped when
+  incomplete; near-duplicates are skipped on write. No consolidation: the bank
+  stays append-only.
+  With the flag off the written record and the embedded text are exactly what
+  they were, pinned by a test that checks both.
+
+- **Room conductor MVP, behind `ROOM_ENABLED` (default off)** (backlog/T25).
+  `/room <request>` hands a free-form task to a conductor that hires one
+  synthesised specialist at a time — the quad ⟨instruction, context, tool
+  profile, model⟩ — rather than staffing a static catalogue. Models are masked
+  (`model_1..3`) behind a price table so the choice is about what the subtask is
+  worth. Two read-only tool profiles; no outbound capability at all, because the
+  approve-gate that would govern one does not exist yet. Hard budget cap per
+  room, unlike the reference, which only ever counted.
+  Three fragilities from the AOrchestra code study were deliberately not
+  copied: a malformed reply is an ordinary turn rather than the end of the task;
+  every turn is recorded, including refusals, so the conductor can see its own
+  mistakes; and the delegation history is capped with the truncation announced.
+  An unknown model is a validation error, not a $0 default.
+  With the flag off the handler is never registered and the command is never
+  advertised, so the bot behaves exactly as before — pinned by a test.
+
 - **Public artifacts are English, and a gate now enforces it** (backlog/T27).
   CLAUDE.md §2 always required it; nothing checked, so Russian reached the
   public mirror on the first resumed publish. `publish-public.sh` gained a
