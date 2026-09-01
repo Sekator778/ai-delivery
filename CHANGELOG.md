@@ -13,6 +13,13 @@ the project does not yet follow strict SemVer (pre-1.0).
 
 Entries accumulate here until the next tag.
 
+- **Rooms run side by side (backlog/T32).** `/room` no longer awaits the
+  whole loop inside the command handler — which, with the bot processing
+  updates one at a time, made the bot deaf for the minutes a room took. The
+  room is a background task under a capped registry (`ROOM_MAX_CONCURRENT`,
+  default 3); over the cap the bot says so; a crashed room reports to the
+  chat instead of vanishing.
+
 - **The room's cap is a permission to hire, not only a stop (backlog/T31).**
   A hire the room cannot pay for is refused before the child runs (per-option
   floor, reason in the history, the prompt names what is affordable); a room

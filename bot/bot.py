@@ -3137,6 +3137,33 @@ def _subagent_env(backend: str = "deepseek",
 _ROOM_TASK_PREFIX = "room-"
 
 
+def _make_room_registry():
+    """Built lazily: dispatcher/ modules are importable only after sys.path setup."""
+    from room_driver import RoomRegistry, max_concurrent_rooms
+    return RoomRegistry(max_concurrent_rooms())
+
+
+class _LazyRegistry:
+    """Holds the real registry from first use on; keeps module import light."""
+
+    def __init__(self) -> None:
+        self._real = None
+
+    def _get(self):
+        if self._real is None:
+            self._real = _make_room_registry()
+        return self._real
+
+    def __getattr__(self, name):
+        return getattr(self._get(), name)
+
+    def __len__(self) -> int:
+        return len(self._get())
+
+
+_room_registry = _LazyRegistry()
+
+
 def _room_enabled() -> bool:
     """ROOM_ENABLED, read at call time so tests can flip it without reimporting."""
     from room_conductor import room_enabled  # local: dispatcher/ is on sys.path
@@ -3193,10 +3220,38 @@ async def room_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # The driver owns the loop from here; on_subtask_done recognises the room
     # prefix and stays out of the way.
-    await room_driver.run_room(
-        request, room_id=task_id, workdir=str(workdir),
-        spawn=_spawn, notify=_notify,
-    )
+    #
+    # Background, not awaited (T32): the bot handles updates one at a time, so
+    # an awaited multi-minute loop here made the whole bot deaf — a second
+    # /room queued behind the first, and so did every other command. The room
+    # runs as a task; the handler returns at once; a registry caps how many
+    # run side by side and a crashed room still reports to the chat.
+    if not _room_registry.acquire(task_id):
+        await update.message.reply_text(
+            f"Сейчас уже работает {len(_room_registry)} комнат(ы) — это предел "
+            f"({_room_registry.limit}). Дождитесь финала одной из них или "
+            f"поднимите ROOM_MAX_CONCURRENT."
+        )
+        return
+
+    async def _run_and_report() -> None:
+        try:
+            await room_driver.run_room(
+                request, room_id=task_id, workdir=str(workdir),
+                spawn=_spawn, notify=_notify,
+            )
+        except Exception as exc:  # noqa: BLE001 — silence is never an outcome
+            logger.exception("room %s crashed", task_id)
+            try:
+                await _notify(f"Комната упала с ошибкой: {exc!r}. "
+                              f"Подробности в логе бота ({task_id}).")
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            _room_registry.release(task_id)
+
+    task = asyncio.create_task(_run_and_report(), name=task_id)
+    _room_registry.active[task_id] = task
 
 
 async def run_subtask(

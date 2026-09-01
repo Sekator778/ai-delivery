@@ -283,6 +283,52 @@ Finish with a short plain-text summary of what you did and what you found.
 
 
 # ---------------------------------------------------------------------------
+# Concurrency — rooms run side by side, under a cap (T32)
+# ---------------------------------------------------------------------------
+ROOM_MAX_CONCURRENT_ENV = "ROOM_MAX_CONCURRENT"
+DEFAULT_MAX_CONCURRENT = 3
+
+
+def max_concurrent_rooms(env: "dict[str, str] | None" = None) -> int:
+    import os
+    src = env if env is not None else os.environ
+    try:
+        value = int(str(src.get(ROOM_MAX_CONCURRENT_ENV, DEFAULT_MAX_CONCURRENT)).strip())
+    except ValueError:
+        return DEFAULT_MAX_CONCURRENT
+    return max(1, value)
+
+
+class RoomRegistry:
+    """Who is in flight, and whether one more may start.
+
+    The live finding (2026-09-01): two /room requests sent back to back ran
+    one after the other, because the command handler awaited the whole loop
+    inline and the bot processes updates one at a time — for the minutes a
+    room took, every other command waited too. The fix is the bot's: run the
+    loop as a background task. This class is the part that is testable
+    without a bot — the cap, and the bookkeeping the bot needs to answer
+    "how many rooms are running" and "may I start another".
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = max(1, limit)
+        self.active: dict[str, object] = {}
+
+    def acquire(self, room_id: str, handle: object = None) -> bool:
+        if len(self.active) >= self.limit:
+            return False
+        self.active[room_id] = handle
+        return True
+
+    def release(self, room_id: str) -> None:
+        self.active.pop(room_id, None)
+
+    def __len__(self) -> int:
+        return len(self.active)
+
+
+# ---------------------------------------------------------------------------
 # Strategy memory — recall on the way in, extraction on the way out (T30)
 # ---------------------------------------------------------------------------
 def recall_strategies(request: str) -> str:
