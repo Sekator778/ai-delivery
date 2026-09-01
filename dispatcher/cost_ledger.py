@@ -11,6 +11,7 @@ Schema (created idempotently on first call):
         task_id         TEXT    NOT NULL,
         stage           TEXT    NOT NULL,           -- ba|architect|...|reviewer|reviewer-agent-poc
         backend         TEXT    NOT NULL,           -- anthropic|deepseek|glm
+        profile         TEXT,                       -- named key profile (T15); NULL = the global key
         cost_usd        REAL    NOT NULL,
         input_tokens    INTEGER,
         output_tokens   INTEGER,
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS cost_events (
     task_id         TEXT    NOT NULL,
     stage           TEXT    NOT NULL,
     backend         TEXT    NOT NULL,
+    profile         TEXT,
     cost_usd        REAL    NOT NULL,
     input_tokens    INTEGER,
     output_tokens   INTEGER,
@@ -65,10 +67,25 @@ CREATE INDEX IF NOT EXISTS idx_ts ON cost_events(ts);
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns a ledger written by an older version does not have.
+
+    ``CREATE TABLE IF NOT EXISTS`` does nothing to a table that already exists,
+    so a database created before a column was introduced would fail every
+    INSERT that names it. Idempotent and silent on a current schema."""
+    have = {row[1] for row in conn.execute("PRAGMA table_info(cost_events)")}
+    for column, ddl in (
+        ("profile", "ALTER TABLE cost_events ADD COLUMN profile TEXT"),
+    ):
+        if column not in have:
+            conn.execute(ddl)
+
+
 def _connect() -> sqlite3.Connection:
     LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(LEDGER_PATH), timeout=10.0)
     conn.executescript(_SCHEMA)
+    _migrate(conn)
     return conn
 
 
@@ -79,6 +96,7 @@ def record(
     backend: str,
     cost_usd: float,
     source: str,
+    profile: Optional[str] = None,
     input_tokens: Optional[int] = None,
     output_tokens: Optional[int] = None,
     cache_read_tokens: Optional[int] = None,
@@ -94,11 +112,11 @@ def record(
         with _connect() as conn:
             conn.execute(
                 "INSERT INTO cost_events "
-                "(ts, task_id, stage, backend, cost_usd, input_tokens, "
+                "(ts, task_id, stage, backend, profile, cost_usd, input_tokens, "
                 "output_tokens, cache_read_tokens, cache_creation_tokens, "
                 "source, elapsed_sec, session_id) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (ts, task_id, stage, backend, float(cost_usd),
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ts, task_id, stage, backend, profile, float(cost_usd),
                  input_tokens, output_tokens, cache_read_tokens,
                  cache_creation_tokens, source, elapsed_sec, session_id),
             )

@@ -184,6 +184,10 @@ def _write_state_json(task_dir: Path, spec: dict) -> None:
             {"at": _now_iso(), "stage": "received", "note": "ingested by task_dispatcher"}
         ],
     }
+    # clarify_auto_resumes persists for the same reason (T10): the clarify dead
+    # man may resume a task on BA defaults exactly ONCE, and the re-ingest it
+    # triggers runs through here — a reset counter would let every later clarify
+    # pause answer itself again instead of waiting for the operator.
     # transient_retries persists across re-ingest so the watcher's
     # auto-requeue is capped at TRANSIENT_RETRY_LIMIT across the task lifetime
     # — without this carry-forward, the dispatcher would reset retries to 0
@@ -214,7 +218,8 @@ def _write_state_json(task_dir: Path, spec: dict) -> None:
     # pipeline start.
     for k in ("branch", "pr_url", "review_trend", "review_trend_iter",
               "transient_retries", "stage_sessions", "limit_parks", "worktree",
-              "cost_usd", "iteration", "triage", "base_branch"):
+              "cost_usd", "iteration", "triage", "base_branch",
+              "clarify_auto_resumes"):
         if prior.get(k) is not None:
             state[k] = prior[k]
     (task_dir / "state.json").write_text(json.dumps(state, indent=2) + "\n")

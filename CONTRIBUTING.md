@@ -80,10 +80,39 @@ Auto-escalation (per `STATE/DECISIONS.md` → `auto-escalate-on-stalled-cheap-ba
 | `SPECS_FOLDER_MIRROR_ENABLED=1` | (agent-path) Additively mirror `01-ba.md`/`02-architecture.md`/`02b-tasks.md` into a Spec-Kit `specs/{spec,plan,tasks}.md` folder. Purely additive — the flat names stay primary; nothing reads the mirror yet (alias-staging phase 1 of the folder migration). |
 | `INVEST_VALIDATION_ENABLED=1` | (agent-path) Run INVEST validation of the BA artifact; blocks on violations unless `INVEST_BLOCKING=0` |
 | `STAGE_RUNNER_MODE=agent` | (planned — Phase C) routes the pipeline through `dispatcher/stage_runner_agent.py` instead of subprocess. Tool restrictions from `.claude/agents/*.md` are enforced |
+| `MEMORY_FLAT_ENABLED=1` | Recall and write-back go to a JSONL flat store (`MEMORY_FLAT_PATH`, default `memory-bank/semantic-export/meta_agent_mem.vectors.jsonl`) instead of Qdrant — same ranking, no database. Produce the file first with `scripts/qdrant-memory.py dump --with-vectors`; TEI is still required (the query must be embedded). `0` (default) = Qdrant, unchanged |
+| `EGRESS_SCOPING_ENABLED=1` | Confine stage children to an allowlist of network domains, enforced by the CLI's own sandbox (local proxy + kernel backstop) rather than by env hygiene alone. `0` (default) = off, byte-identical settings. Widen the list per host with `EGRESS_EXTRA_DOMAINS=host1,host2`. Requires a smoke run on a sandbox target before trusting it — see `STATE/DESIGN-2026-08-21-egress-scoping.md` |
+| `CLARIFY_DEADMAN_HOURS=6` | Clarify dead man: a task parked on BA's `[NEEDS CLARIFICATION]` questions for this many hours is resumed ONCE on the defaults the BRD already records for those markers (worklog + Telegram say so). `0` (default) = off, the pause waits for a human forever. A second clarify pause on the same task always waits for a human |
 | `STAGE_ESCALATION_AT_ITERATION=999` | Disable auto-escalation (default 2) |
 | `CC_LANGSMITH_API_KEY=ls__...` | LangSmith traces light up for every stage |
 
 Edit `bot/.env`, restart services. Don't edit `bot/.env.example` (template only — committed).
+
+### Provider key profiles
+
+One provider can have several keys — a personal one, a work one, someone else's
+quota. `bot/providers.json` (gitignored; copy `bot/providers.example.json`)
+gives each a name:
+
+```json
+{"profiles": {"deepseek-alt": {"backend": "deepseek",
+                               "api_key_env": "DEEPSEEK_API_KEY_ALT"}},
+ "defaults": {"deepseek": "deepseek-main"}}
+```
+
+The file holds **no secrets**: a profile points at an environment variable
+(`api_key_env`, filled from `bot/.env`) or a file (`api_key_file`). Which
+profile pays is decided per task — a `model_routing` value may name it after a
+colon, `"deepseek:alt"` — or per session with `/backend deepseek:alt` in
+Telegram, which stamps `provider_profile` into every new spec. Neither given:
+`defaults.<backend>`. **No registry at all: nothing changes** — stages use the
+global `DEEPSEEK_API_KEY` / `GLM_API_KEY` exactly as before.
+
+The profile name lands in `state.json`, in the cost ledger and in
+`ops/cost-report.py`'s "By key profile" slice, so spend can be split per quota.
+The key value never does: the parent resolves it and writes only
+`ANTHROPIC_AUTH_TOKEN` into the child, and a child running on a profile does
+not get the provider's default key either.
 
 ---
 
@@ -246,9 +275,13 @@ than it is:
   before the 2026-05-27 key rotation; scanning it would be red forever. CI
   scans what a change *adds*.
 
-CI needs `gitleaks` on `PATH` (without it 18 `test_publish_public` tests fail)
+CI needs `gitleaks` on `PATH` (without it the `test_publish_public` tests fail)
 and a full clone with tags (`scripts/publish-public.sh` refuses to run without
 a reachable version tag). If you reproduce a CI failure locally, match those.
+Those tests cover a script whose use is **paused**: the mirror is live but no
+longer refreshed since 2026-08-21 (`CLAUDE.md` §1). They keep running — the
+export filter they exercise is what stands between an internal directory and a
+live public repository.
 
 ### Pre-flight checklist before merge
 
@@ -274,6 +307,58 @@ Recurring patterns of work that keep the project's memory and state coherent.
 - **Start of session** — STATE/CURRENT.md is auto-loaded by Claude Code project context (no action needed; just know it's there)
 - **During work** — when state shifts meaningfully (a stage completed, a phase moved, a decision made), update STATE/CURRENT.md inline. Don't batch — the recovery layer must be current
 - **End of session** — STATE/CURRENT.md reflects exact state for the next session's resume point. If a session crashes, the next one reads CURRENT.md and continues without context loss
+
+### Branch model
+
+Two long-lived branches, and each has one job.
+
+**`dev` is where development happens.** Every change lands there, through a
+pull request. It is what a working clone sits on.
+
+**`master` is what the outside world starts from.** It is the repository's
+default branch on GitHub, so it is what a fresh clone gets, what a new harness
+session is cut from, and what anything triggered against this repo runs. That
+is the whole reason it exists — not an archive of past releases.
+
+Which gives the one rule that matters: **`master` must not go stale.** A
+trigger branch that lags behind `dev` runs old code and reports on it
+confidently. Merge `dev` into `master` once work has landed and CI is green —
+at a milestone, at a release, and in any case before anything is triggered from
+`master`. Waiting for a version tag is not a reason to leave it behind.
+
+| Branch | What it is |
+|---|---|
+| `master` | GitHub default; what clones, sessions and triggers start from. Kept current by merging `dev` into it. Never committed to directly. |
+| `dev` | where development happens; base for every pull request |
+| `feat/*`, `fix/*`, `chore/*` | short-lived work branches, one change each |
+| `claude/*` | the same, cut by a Claude Code harness session |
+| `archive/*` | frozen history kept on purpose — never delete, never build on |
+
+Rules that follow from it:
+
+- **Base every PR on `dev`.** GitHub preselects `master`, because `master` is
+  the default on purpose — retarget the PR. That retarget is the price of
+  having one branch that triggers cleanly, and it is a two-second edit in the
+  PR header.
+- **Nothing is committed to `master` directly.** It only ever receives `dev`.
+- **`dev → master` is fast-forward when it can be**, and a merge commit when it
+  cannot. The fast-forward is the healthy case and means `master` carries
+  exactly what `dev` does. If it refuses, find out what landed on `master` out
+  of band before going further — but do not leave `master` stale over it.
+- **A work branch dies with its PR.** Delete it after the merge (the repository
+  has "automatically delete head branches" on; delete a stale one by hand with
+  `git push origin --delete <branch>`). Before deleting anything by hand, prove
+  it is merged: `git merge-base --is-ancestor origin/<branch> origin/dev`. A
+  branch that fails that check still carries work — check what it is before
+  removing it, and never delete `archive/*`.
+- **Merge style into `dev`:** pull requests land as **merge commits**, not
+  squashes — the individual commit messages are this project's record of *why*,
+  and squashing throws that away.
+- **Hotfixes** still go through `dev`, then straight into `master`. Branching
+  off `master` is for the case where `dev` carries work that must not ship yet.
+
+Tagging a version is a separate, smaller thing: it names a state of the tree
+worth returning to. Checklist: [ops/RELEASE.md](ops/RELEASE.md).
 
 ### Per-feature ritual
 

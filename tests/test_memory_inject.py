@@ -201,6 +201,42 @@ class RetireCapTests(unittest.TestCase):
         self.assertFalse([u for u in calls if "/delete" in u])
 
 
+class EphemeralTargetPortabilityTests(unittest.TestCase):
+    """The predicate must answer the same on every host (backlog/T20).
+
+    `gettempdir()` answers "is this ephemeral *here*". The store is portable —
+    the JSONL travels in git and gets inspected from Linux, while the points
+    were written on macOS, whose $TMPDIR is /var/folders/<xx>/<yyy>/T/. Before
+    this was fixed the same record was ephemeral on one machine and legitimate
+    on another, so a purge run from the wrong host silently found nothing.
+    """
+
+    MACOS_TMP = [
+        "/var/folders/nt/0tkgtyt96_v12yx82b79b5bw0000gn/T/tmpwcn_cr87/repo",
+        "/private/var/folders/ab/cdefgh/T/tmpx/repo",
+    ]
+    NOT_TMP = [
+        "/Users/someone/projects/ai-delivery",
+        "/var/folders-not-a-tmpdir/x",
+        "/var/folders/only/two/parts",
+        "/home/someone/repo",
+        "",
+    ]
+
+    def test_macos_tmpdir_recognised_from_any_host(self) -> None:
+        for path in self.MACOS_TMP:
+            self.assertTrue(mi._is_ephemeral_target(path), path)
+
+    def test_real_targets_are_not_ephemeral(self) -> None:
+        for path in self.NOT_TMP:
+            self.assertFalse(mi._is_ephemeral_target(path), path)
+
+    def test_local_tempdir_still_recognised(self) -> None:
+        import tempfile as _tf
+        self.assertTrue(
+            mi._is_ephemeral_target(os.path.join(_tf.gettempdir(), "tmpx", "repo")))
+
+
 class SuiteIsolationTests(unittest.TestCase):
     """The suite must not be able to write into a live memory store.
 

@@ -4,7 +4,9 @@ One place that parks a budget/cap-stopped task in ``awaiting-input/`` and asks t
 bot to surface ``[Продолжить]/[Удалить]`` buttons. Used by BOTH:
 
   * the stage runner — when the post-pipeline decision is a cap stop (cost_cap /
-    iteration_cap / stagnant / …), and
+    iteration_cap / stagnant / …) and, since T08, when a MID-pipeline cost/token
+    cap fires between stages (that path used to write ``stage="failed"`` and send
+    a FAILED line, so a designed operator gate looked like a crash), and
   * the watcher — when it finds an over-budget orphan it must NOT respawn (a
     respawn would skip every completed stage and just re-hit the cap — the
     ``$21-twice`` re-fail loop).
@@ -27,8 +29,8 @@ from telegram_io import _notify_bot
 # grant another iteration) or [Удалить]. Drives the budget_stop bot prompt and
 # gates which post-pipeline dispositions route through park().
 BUDGET_STOP_REASONS = frozenset({
-    "cost_cap", "iteration_cap", "stagnant", "watchdog_idle", "watchdog_total",
-    "unparseable", "unknown",
+    "cost_cap", "token_cap", "iteration_cap", "stagnant", "watchdog_idle",
+    "watchdog_total", "unparseable", "unknown",
 })
 
 _AWAITING_INPUT_DIR = Path(__file__).resolve().parent.parent / "tasks" / "awaiting-input"

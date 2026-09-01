@@ -133,6 +133,7 @@ import cost_ledger as _cost_ledger  # noqa: E402  (honest per-stage cost rows)
 import memory_inject as _memory_inject  # noqa: E402  (task-scoped recall + write-back)
 from budget_gate import park as _park_budget_stop, BUDGET_STOP_REASONS as _BUDGET_STOP_REASONS  # noqa: E402
 import limit_stall as _limit_stall  # noqa: E402  (limit-outage detector, #11)
+import provider_profiles as _profiles  # noqa: E402  (named key profiles, T15)
 import proc_reaper as _proc_reaper  # noqa: E402  (child process-group kill, #18)
 from target_policy import (  # noqa: E402  (god-module split 2026-06-04)
     _poc_mode_for_target,
@@ -152,6 +153,7 @@ from runner_state import (  # noqa: E402  (god-module split 2026-06-04)
     _append_worklog,
     _update_state,
     _append_history,
+    _now_iso,
 )
 # Names the orchestrator no longer references directly but external callers
 # (tests / ops) still read via stage_runner_agent.* — re-exported so the
@@ -1019,7 +1021,13 @@ def _execute_single_stage_inner(
         backend, escalated_from = backend_override, None
     else:
         backend, escalated_from = _resolve_stage_backend(stage, iteration, routing, tier)
-    env = _subagent_env(backend, stage)
+    # Named key profile for this provider (T15). Only meaningful when
+    # bot/providers.json exists; for_stage() drops the profile when the stage was
+    # escalated or L-guarded onto another backend, because a deepseek profile
+    # means nothing to anthropic.
+    profile = _profiles.for_stage(routing, stage, backend,
+                                  spec.get("provider_profile"))
+    env = _subagent_env(backend, stage, profile=profile)
     if escalated_from:
         print(f"[agent-pipeline] stage={stage} backend escalated: "
               f"{escalated_from} -> {backend} (iteration {iteration} >= "
@@ -1369,6 +1377,7 @@ def _execute_single_stage_inner(
         "elapsed_sec": elapsed,
         "stage": f"{stage}-agent-poc",
         "backend": backend,
+        "profile": profile,
         "escalated_from": escalated_from,
         "verdict": verdict_block,
         "cost": cost_info,
@@ -1392,6 +1401,7 @@ def _execute_single_stage_inner(
             task_id=task_dir.name,
             stage=stage,
             backend=backend,
+            profile=profile,
             cost_usd=float(cost_info.get("total_cost_usd") or 0.0),
             source=cost_info.get("cost_source") or "cli",
             input_tokens=cost_info.get("input_tokens"),
@@ -1589,12 +1599,16 @@ def _maybe_pause_for_clarifications(
     _clarify.write_pending_payload(task_dir, questions)
     _update_state(
         task_dir,
-        stage="awaiting_clarify",
+        stage=_clarify.PAUSED_STAGE,
         clarify_pending={"count": len(questions), "questions": questions},
         cost_usd=cumulative_cost,
+        # An EXPLICIT pause stamp for the dead-man sweep (T10). The state.json
+        # mtime cannot serve: re-ingest rewrites the file with carried-forward
+        # fields, which would reset the clock and keep the task waiting forever.
+        clarify_paused_at=_now_iso(),
     )
     _append_history(
-        task_dir, "awaiting_clarify",
+        task_dir, _clarify.PAUSED_STAGE,
         f"paused for {len(questions)} clarification question(s)",
     )
     _append_worklog(
@@ -1812,9 +1826,11 @@ def _terminate_pipeline(
     Two deliberate pass-throughs (committee 2026-06-02):
       - _CLARIFY_PAUSE_RC: the clarify pause ALREADY self-moved the task to
         awaiting-input/; re-moving a vanished dir would crash.
-      - rc == 5 (cost/token cap): the dollar/token cap is the loose notional
-        safety net and stays a hard failed/ in place (the watcher relocates it,
-        PR3); handoff must not reclassify a budget abort as awaiting-input.
+      - rc == 5 (cost/token cap): the cap stop ALREADY self-moved the task to
+        awaiting-input/ via budget_gate.park (T08) — the operator gate of
+        2026-06-07, which the mid-pipeline checks used to bypass. The committee's
+        2026-06-02 constraint still holds as written: the graceful handoff must
+        not reclassify a budget abort, so the pass-through stays.
       - RC_LIMIT_STALL (#11): the limit park ALREADY self-moved the task to
         awaiting-input/ with a resume_at; a handoff would rewrite it as a
         terminal failure and drop the auto-requeue.
@@ -2021,12 +2037,57 @@ def _reviewer_triage_hint(state: dict) -> str:
     return ""
 
 
+def _cap_stop(task_dir: Path, task_id: str, stage: str, msg: str, *,
+              stop_reason: str, cost_usd: float, cost_cap: float,
+              park: bool = True) -> int:
+    """The ONE branch every mid-pipeline cap stop goes through (T08).
+
+    A cap stop is a designed operator gate, not a crash: caps are tuned
+    empirically and WILL fire. The post-pipeline path has parked them in
+    ``awaiting-input/`` with [Продолжить]/[Удалить] since 2026-06-07, but the
+    mid-pipeline checks (token cap, per-stage cost cap, the pair check after the
+    parallel stages) kept writing ``stage="failed"`` + a FAILED line, so both L
+    tasks that hit their cap on developer (2026-08-17) landed in ``failed/`` and
+    needed hand surgery on state.json to revive. The 2026-06-02 committee note
+    that made rc=5 a hard ``failed/`` is preserved where it applies — the
+    graceful handoff still must not reclassify a budget abort — but the bucket
+    now comes from ``budget_gate.park`` instead, per the 2026-06-07 operator gate
+    (and the original Q2 decision of 2026-05-24).
+
+    Breadcrumbs are written BEFORE the park: ``park`` moves the task dir out of
+    ``active/``, so anything appended afterwards would land in a vanished path.
+    The task's worktree is deliberately LEFT alive — unlike a post-pipeline park
+    (branch pushed, PR open), a mid-pipeline stop can sit on uncommitted stage
+    work, and ``_ensure_task_worktree`` reuses a live checkout on resume.
+
+    ``park=False`` records the stop but leaves the move to the caller — used by
+    the two stages of the parallel pair, which must not move the task dir out
+    from under each other (see ``_run_two_stages_parallel``).
+
+    Returns 5, still one of ``_terminate_pipeline``'s short-circuits — now for
+    the same reason as ``_CLARIFY_PAUSE_RC``: the task has ALREADY self-moved.
+    The park's ``budget_stop`` notification REPLACES the FAILED message, so a cap
+    stop still emits exactly one terminal message (issue #19).
+    """
+    print(f"[agent-pipeline] {msg}; "
+          f"{'parking for operator decision' if park else 'deferring park to the pair check'}",
+          file=sys.stderr)
+    _append_worklog(task_dir, f"BUDGET STOP: {msg}")
+    _append_history(task_dir, stage, msg)
+    if park:
+        _park_budget_stop(task_dir, task_id, stop_reason=stop_reason,
+                          cost_usd=cost_usd, cost_cap=cost_cap)
+    return 5
+
+
 def _token_cap_exceeded(task_dir: Path, state: dict, stage: str,
-                        task_id: str) -> bool:
+                        task_id: str, *, cost_usd: float = 0.0,
+                        cost_cap: float = 0.0, park: bool = True) -> bool:
     """Accumulate this stage's tokens into state.tokens_used and, when triage is
     acting with a token_cap, abort the run if the running total exceeds it. The
     cap is read from state.triage.caps (written by triage + the upgrade ladder).
-    Returns True when the run was aborted. Tokens are tracked even when triage is
+    Returns True when the run was aborted — the task is parked for the operator
+    (``_cap_stop``), not failed. Tokens are tracked even when triage is
     off/shadow (useful baseline data), but only ENFORCED when acting."""
     tokens_used = _add_tokens_used(task_dir, _read_stage_tokens(task_dir, stage))
     state["tokens_used"] = tokens_used
@@ -2043,13 +2104,8 @@ def _token_cap_exceeded(task_dir: Path, state: dict, stage: str,
     if not token_cap or tokens_used <= int(token_cap):
         return False
     msg = f"token cap hit: used={tokens_used} > cap={int(token_cap)} tok"
-    print(f"[agent-pipeline] {msg}; aborting", file=sys.stderr)
-    _append_worklog(task_dir, f"FAILED: {msg}")
-    _append_history(task_dir, stage, msg)
-    _update_state(task_dir, stage="failed")
-    # rc=5 short-circuits _terminate_pipeline (no _handoff_terminal call) —
-    # this is the sole terminal message for a token-cap stop (issue #19).
-    _send_telegram(f"[{task_id}] FAILED: {msg}")
+    _cap_stop(task_dir, task_id, stage, msg, stop_reason="token_cap",
+              cost_usd=cost_usd, cost_cap=cost_cap, park=park)
     return True
 
 
@@ -2240,12 +2296,20 @@ def _run_pipeline_stage_with_breadcrumbs(
     cumulative_cost: float,
     cost_cap: float,
     state_path: Path,
+    *,
+    defer_cap_park: bool = False,
 ) -> tuple[int, float, dict]:
     """Run one stage with full breadcrumb wiring. Returns (rc, new_cumulative_cost, refreshed_state).
 
     On rc != 0 or cost-cap hit, caller is responsible for returning rc from
     run_pipeline. This helper does NOT itself call sys.exit / return early —
     it just runs the stage and reports back.
+
+    ``defer_cap_park`` keeps a cap stop from parking the task here (breadcrumbs
+    only, still rc=5): the two stages of the parallel pair run concurrently, so
+    whichever hit the cap first would move the task dir out from under the other
+    one and send a second terminal message. Their shared park happens once, in
+    ``_run_two_stages_parallel``, after both futures have joined.
     """
     # BRD is required for stages after BA; skip the precheck for BA itself
     # since BA is the producer of 01-ba.md.
@@ -2406,22 +2470,19 @@ def _run_pipeline_stage_with_breadcrumbs(
     # this stage's tokens into state.tokens_used; when triage is acting with a
     # token_cap, abort if exceeded. This is the cap that actually binds on a
     # flat-plan host (the dollar cap below is a loose, notional safety net).
-    if _token_cap_exceeded(task_dir, state, stage, task_id):
+    if _token_cap_exceeded(task_dir, state, stage, task_id,
+                           cost_usd=cumulative_cost, cost_cap=cost_cap,
+                           park=not defer_cap_park):
         return 5, cumulative_cost, state
 
     # Cost cap guard — Phase C Step 2a safety (notional $ under a subscription).
     if cumulative_cost > cost_cap:
         msg = (f"cost cap hit: cumulative=${cumulative_cost:.4f} "
                f"> cap=${cost_cap:.2f}")
-        print(f"[agent-pipeline] {msg}; aborting", file=sys.stderr)
-        _append_worklog(task_dir, f"FAILED: {msg}")
-        _append_history(task_dir, stage, msg)
-        _update_state(task_dir, stage="failed")
-        # rc=5 is one of _terminate_pipeline's short-circuits (cost cap does
-        # NOT route through _handoff_terminal) — this is the sole terminal
-        # message for this stop, so it stays unconditional (issue #19).
-        _send_telegram(f"[{task_id}] FAILED: {msg}")
-        return 5, cumulative_cost, state
+        return (_cap_stop(task_dir, task_id, stage, msg, stop_reason="cost_cap",
+                          cost_usd=cumulative_cost, cost_cap=cost_cap,
+                          park=not defer_cap_park),
+                cumulative_cost, state)
 
     # C.3 — INVEST validation of the BA artifact when enabled. Blocks the
     # pipeline on violations unless INVEST_BLOCKING=0 (compass / ROADMAP C.3).
@@ -2523,12 +2584,12 @@ def _run_two_stages_parallel(
         future_a = executor.submit(
             _run_pipeline_stage_with_breadcrumbs,
             task_dir, target_repo, stage_a, state, task_id,
-            cumulative_cost_in, cost_cap, state_path,
+            cumulative_cost_in, cost_cap, state_path, defer_cap_park=True,
         )
         future_b = executor.submit(
             _run_pipeline_stage_with_breadcrumbs,
             task_dir, target_repo, stage_b, state, task_id,
-            cumulative_cost_in, cost_cap, state_path,
+            cumulative_cost_in, cost_cap, state_path, defer_cap_park=True,
         )
         rc_a, cost_after_a, _state_a = future_a.result()
         rc_b, cost_after_b, _state_b = future_b.result()
@@ -2540,16 +2601,19 @@ def _run_two_stages_parallel(
     )
     _update_state(task_dir, cost_usd=combined_cumulative)
 
-    if combined_cumulative > cost_cap:
-        msg = (f"cost cap hit: cumulative=${combined_cumulative:.4f} "
-               f"> cap=${cost_cap:.2f}")
-        print(f"[agent-pipeline] {msg}; aborting", file=sys.stderr)
-        _append_worklog(task_dir, f"FAILED: {msg}")
-        _append_history(task_dir, "tester+security", msg)
-        _update_state(task_dir, stage="failed")
-        # rc=5 short-circuits _terminate_pipeline — sole terminal message.
-        _send_telegram(f"[{task_id}] FAILED: {msg}")
-        return 5, combined_cumulative, state, 5, combined_cumulative, state
+    # The pair's single cap stop: either child deferred one to us (rc=5), or the
+    # combined total tips the dollar cap now that both stages are accounted for.
+    # One park, one budget_stop notification — the old code could park/announce
+    # twice for the same stop (a child's FAILED line plus this one).
+    over_cost = combined_cumulative > cost_cap
+    if over_cost or 5 in (rc_a, rc_b):
+        msg = ((f"cost cap hit: cumulative=${combined_cumulative:.4f} "
+                f"> cap=${cost_cap:.2f}") if over_cost else
+               f"token cap hit during {stage_a}+{stage_b} (see worklog)")
+        rc = _cap_stop(task_dir, task_id, f"{stage_a}+{stage_b}", msg,
+                       stop_reason="cost_cap" if over_cost else "token_cap",
+                       cost_usd=combined_cumulative, cost_cap=cost_cap)
+        return rc, combined_cumulative, state, rc, combined_cumulative, state
 
     if state_path.exists():
         state = json.loads(state_path.read_text())

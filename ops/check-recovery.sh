@@ -55,7 +55,7 @@ echo ""
 TID="tg-20260524-124913-11ec"
 echo "── task $TID ──"
 loc=""
-for d in active awaiting-input awaiting-approval done failed; do
+for d in active awaiting-input awaiting-approval "done" failed; do
   if [ -d "tasks/$d/$TID" ]; then loc=$d; break; fi
 done
 if [ -z "$loc" ]; then
@@ -65,7 +65,12 @@ fi
 echo "  $PASS task in tasks/$loc/"
 echo "  current stage:   $(jq -r .stage tasks/$loc/$TID/state.json 2>/dev/null)"
 echo "  history events:  $(jq -r '.history|length' tasks/$loc/$TID/state.json 2>/dev/null) (was 4 pre-reboot)"
-echo "  artifacts:       $(ls tasks/$loc/$TID/*.md 2>/dev/null | xargs -I{} basename {} | tr '\n' ' ')"
+artifacts=""
+for f in "tasks/$loc/$TID"/*.md; do
+  [ -e "$f" ] || continue          # the glob is literal when nothing matches
+  artifacts="$artifacts $(basename "$f")"
+done
+echo "  artifacts:      $artifacts"
 echo ""
 
 # 5. Runner respawn check

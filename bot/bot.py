@@ -7,6 +7,7 @@ scripts. This module never sends Telegram messages itself for normal replies.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -165,7 +166,9 @@ def load_user_registry() -> dict[int, dict[str, str]]:
 
 sys.path.append(str(Path(__file__).resolve().parent.parent / "dispatcher"))
 import project_registry as _registry  # noqa: E402  (path set just above)
-from child_env import build_child_env  # noqa: E402  (same shared dispatcher dir)
+import provider_profiles as _profiles  # noqa: E402  (ONE registry parser, shared)
+import memory_inject as _memory  # noqa: E402  (ONE module knows where memory lives)
+from child_env import BACKEND_VARS, build_child_env  # noqa: E402  (same shared dispatcher dir)
 import proc_reaper as _proc_reaper    # noqa: E402  (same shared dispatcher dir)
 
 PROJECTS_FILE = Path(__file__).resolve().parent / "projects.json"
@@ -201,9 +204,12 @@ def _resolve_target_repo(body: str) -> tuple[str, str, Optional[str]]:
     body = body.lstrip()
     alias: Optional[str] = None
     if body.startswith("@"):
-        head, _, rest = body.partition(" ")
-        alias = head[1:].strip()
-        body = rest.lstrip()
+        # Split on ANY whitespace: operators often put the task text on the
+        # next line right after "@alias", and a space-only partition would
+        # swallow the newline into the alias token.
+        parts = body.split(maxsplit=1)
+        alias = parts[0][1:].strip()
+        body = parts[1].lstrip() if len(parts) > 1 else ""
 
     registry = _load_projects()
     projects = _registry.project_paths(registry)
@@ -690,6 +696,13 @@ def _write_spec_to_inbox(
         "task_id": task_id,
         "created_at": now.isoformat().replace("+00:00", "Z"),
     }
+    # Operator's /backend selection (T15): WHICH KEY of a provider pays for
+    # this task. Deliberately not written into model_routing — the L-tier guard
+    # keys on a stage being ABSENT there, so filling it in would silently
+    # disable that guard. Absent selection ⇒ absent field ⇒ unchanged spec.
+    selection = _profiles.spec_field(load_state().get("backend_profile"))
+    if selection:
+        spec["provider_profile"] = selection
     task_dir = THIN_MODE_INBOX / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
     spec_path = task_dir / "spec.json"
@@ -1119,61 +1132,20 @@ async def approval_callback(update: Update, context: object) -> None:
 
 
 # ---------------------------------------------------------------------------
-# /memo + /recall — semantic long-term memory (Qdrant + FastEmbed)
+# /memo + /recall — semantic long-term memory
 # ---------------------------------------------------------------------------
-# Replaces the Ollama-based stack from Phase X (qwen2.5:14b + bge-m3, ~9.5 GB
-# disk, 30-60 s per fact). FastEmbed runs ONNX locally, ~2 GB cached on
-# first use, sub-100 ms per embedding on CPU. SOTA multilingual (RU+EN) via
-# `intfloat/multilingual-e5-large`; override with MEMO_EMBED_MODEL +
-# MEMO_EMBED_DIMS for any model in fastembed.TextEmbedding.list_supported_models().
-
-MEMO_QDRANT_URL = os.environ.get("MEMO_QDRANT_URL", "http://127.0.0.1:6333")
-MEMO_COLLECTION = os.environ.get("MEMO_COLLECTION", "meta_agent_mem")
-MEMO_EMBED_MODEL = os.environ.get(
-    "MEMO_EMBED_MODEL",
-    "intfloat/multilingual-e5-large",
-)
-MEMO_EMBED_DIMS = int(os.environ.get("MEMO_EMBED_DIMS", "1024"))
-
-_embedder = None
-_collection_initialized = False
-
-
-def _get_embedder():
-    global _embedder
-    if _embedder is None:
-        from fastembed import TextEmbedding
-        logger.info(
-            "memo: loading FastEmbed model %s (first call may download ~2 GB)",
-            MEMO_EMBED_MODEL,
-        )
-        _embedder = TextEmbedding(model_name=MEMO_EMBED_MODEL)
-    return _embedder
-
-
-def _embed_text(text: str) -> list[float]:
-    embedder = _get_embedder()
-    return list(next(iter(embedder.embed([text]))))
-
-
-async def _ensure_collection(session: aiohttp.ClientSession) -> None:
-    global _collection_initialized
-    if _collection_initialized:
-        return
-    async with session.get(f"{MEMO_QDRANT_URL}/collections/{MEMO_COLLECTION}") as r:
-        if r.status == 200:
-            _collection_initialized = True
-            return
-    body = {"vectors": {"size": MEMO_EMBED_DIMS, "distance": "Cosine"}}
-    async with session.put(
-        f"{MEMO_QDRANT_URL}/collections/{MEMO_COLLECTION}", json=body
-    ) as r:
-        if r.status not in (200, 201):
-            raise RuntimeError(
-                f"Qdrant collection create failed: {r.status} {await r.text()}"
-            )
-    _collection_initialized = True
-
+# These used to embed with FastEmbed here and talk to Qdrant over HTTP. Two
+# problems with that, both fixed by going through dispatcher/memory_inject
+# (T17): the bot embedded with a DIFFERENT model than the pipeline
+# (multilingual-e5-large vs TEI/bge-m3) while writing into the SAME collection,
+# so the two families of vectors were never comparable; and both commands broke
+# the moment Qdrant stopped — which is now the normal state, since the flat
+# store replaced it (T13). memory_inject owns "where memory lives"; the bot
+# just asks it.
+#
+# memory_inject is synchronous stdlib HTTP, so every call goes through an
+# executor: blocking the bot's event loop on an embed would stall every other
+# chat.
 
 async def memo_command(update: Update, context: object) -> None:
     """/memo <text> — store a fact in long-term semantic memory."""
@@ -1196,42 +1168,22 @@ async def memo_command(update: Update, context: object) -> None:
 
     try:
         loop = asyncio.get_running_loop()
-        vector = await loop.run_in_executor(None, _embed_text, text)
-
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            await _ensure_collection(session)
-
-            point_id = uuid.uuid4().hex
-            payload = {
-                "points": [{
-                    "id": point_id,
-                    "vector": vector,
-                    "payload": {
-                        "text": text,
-                        "user": user["name"],
-                        "source": "telegram",
-                        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    },
-                }],
-            }
-            async with session.put(
-                f"{MEMO_QDRANT_URL}/collections/{MEMO_COLLECTION}/points?wait=true",
-                json=payload,
-            ) as resp:
-                qdrant_resp = await resp.json()
-
-        if qdrant_resp.get("result", {}).get("status") == "completed":
+        point_id = await loop.run_in_executor(
+            None,
+            functools.partial(_memory.remember, text, source="telegram",
+                              extra={"user": user["name"]}),
+        )
+        if point_id:
             await context.bot.send_message(
-                update.effective_chat.id,
-                f"✓ Запомнил: {text[:200]}",
-            )
+                update.effective_chat.id, f"✓ Запомнил: {text[:200]}")
             logger.info("memo: stored fact id=%s user=%s", point_id, user["name"])
         else:
             await context.bot.send_message(
                 update.effective_chat.id,
-                f"❌ Qdrant: {qdrant_resp}",
-            )
+                "❌ Не сохранил — память недоступна. Проверь TEI "
+                "(<code>aidstatus</code>) и, если flat-store включён, что файл "
+                "хранилища на месте.",
+                parse_mode="HTML")
     except Exception as exc:
         logger.exception("memo: failed to store fact")
         await context.bot.send_message(
@@ -1258,25 +1210,8 @@ async def recall_command(update: Update, context: object) -> None:
 
     try:
         loop = asyncio.get_running_loop()
-        vector = await loop.run_in_executor(None, _embed_text, text)
-
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            await _ensure_collection(session)
-
-            async with session.post(
-                f"{MEMO_QDRANT_URL}/collections/{MEMO_COLLECTION}/points/search",
-                json={"vector": vector, "limit": 5, "with_payload": True},
-            ) as resp:
-                if resp.status != 200:
-                    await context.bot.send_message(
-                        update.effective_chat.id,
-                        f"❌ Qdrant {resp.status}",
-                    )
-                    return
-                data = await resp.json()
-
-        hits = data.get("result", [])
+        hits = await loop.run_in_executor(
+            None, functools.partial(_memory.search_text, text, 5))
         if not hits:
             await context.bot.send_message(
                 update.effective_chat.id,
@@ -1527,6 +1462,7 @@ HELP_TEXT = """🤖 *ai-delivery — справка*
 • `/task [@alias] <текст>` — задача в pipeline (BA→Arch→Dev→Test→Sec→Reviewer). `@alias` выбирает целевой репо (см. `/projects`); без `@` — в проект по умолчанию. Открывает PR, спрашивает [Да]/[Нет].
 • `/stt` — *переключатель* режима «голос→текст». Включил → любое голосовое/аудио возвращает только распознанный текст (без задач и вопросов); `/stt` ещё раз — выключил. Разово: ответь `/stt` на конкретное голосовое/аудио. ⚠️ Требует поднятого `services/stacks/voice/`.
 • `/projects` — список известных алиасов и куда они указывают.
+• `/backend [<backend>[:<профиль>]|off]` — каким *ключом* провайдера платят новые задачи (профили из `bot/providers.json`). Без аргументов — текущий выбор и список профилей.
 • `/refresh_code [@alias]` — принудительный re-index CodeGraph для target-репо (escape hatch когда watcher confused). Без `@alias` — default project.
 • `/main <текст>` — прямой канал к Claude в репо ai-delivery (фреймворк сам себя развивает).
 • `/usage [today|week|all]` — отчёт по тратам, по стадиям и бэкендам.
@@ -1623,6 +1559,65 @@ async def projects_command(update: Update, context: object) -> None:
     await context.bot.send_message(
         update.effective_chat.id,
         "\n".join(lines),
+        parse_mode="HTML",
+    )
+
+
+async def backend_command(update: Update, context: object) -> None:
+    """`/backend [<backend>[:<profile>]|off]` — which provider KEY new tasks use.
+
+    A provider can have several keys (personal, work, someone else's quota);
+    bot/providers.json names them and this command picks one for the tasks
+    created from now on. Tasks already in flight keep the key they started
+    with. Without arguments it reports the current selection and the registry.
+    The selection is stored in the bot's durable state, so it survives a
+    restart — the operator set it once, not once per boot.
+    """
+    user_id = update.effective_user.id
+    if user_id not in USER_REGISTRY:
+        logger.warning(
+            "Silent reject: /backend from unauthorized user_id=%d", user_id,
+        )
+        return
+    chat_id = update.effective_chat.id
+    backends = tuple(BACKEND_VARS)
+    arg = " ".join(context.args) if getattr(context, "args", None) else ""
+    state = load_state()
+    current = state.get("backend_profile")
+
+    if not arg:
+        known = _profiles.available()
+        lines = [f"<b>Ключ провайдера для новых задач</b>: "
+                 f"<code>{current or 'по умолчанию (глобальные ключи)'}</code>", ""]
+        if known:
+            lines.append("Профили в реестре:")
+            defaults = _profiles.defaults()
+            for name, backend in known:
+                mark = " ← default" if defaults.get(backend) == name else ""
+                lines.append(f"• <code>{backend}:{name}</code>{mark}")
+        else:
+            lines.append("Реестра нет (<code>bot/providers.json</code>) — "
+                         "задачи идут на глобальных ключах из <code>bot/.env</code>.")
+        lines += ["", "Выбрать: <code>/backend deepseek:alt</code> · "
+                      "сбросить: <code>/backend off</code>"]
+        await context.bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+        return
+
+    label, error = _profiles.parse_selection(arg, backends=backends)
+    if error:
+        await context.bot.send_message(chat_id, f"⚠️ {error}")
+        return
+    if label:
+        state["backend_profile"] = label
+    else:
+        state.pop("backend_profile", None)
+    save_state(state)
+    logger.info("backend selection: %s -> %s", current, label)
+    await context.bot.send_message(
+        chat_id,
+        (f"✅ Новые задачи будут платить ключом <code>{label}</code>."
+         if label else
+         "✅ Сброшено: новые задачи идут на глобальных ключах из bot/.env."),
         parse_mode="HTML",
     )
 
@@ -1928,6 +1923,24 @@ async def _maybe_handle_clarify_reply(update: Update) -> bool:
     task_id = task_dir.name
     if bucket != "awaiting-input":
         stage = str(state.get("stage") or bucket)
+        # An answer that arrives after the clarify DEAD MAN already resumed the
+        # task on BA defaults (T10) is not a stale reply to a closed task — the
+        # task is running right now. Say what actually happened instead of
+        # "закрыта", which sent the operator looking for a task that was fine.
+        deadman = state.get("clarify_deadman") or {}
+        if deadman:
+            await update.message.reply_text(
+                f"⏭️ ответ опоздал: задача <code>{task_id}</code> продолжена по "
+                f"дефолтам BA (ждала {deadman.get('waited_hours', '?')} ч), сейчас "
+                f"{bucket}/{stage}. Ответ не принят — если дефолты не те, "
+                f"<code>/requeue {task_id}</code> с уточнением в промпте.",
+                parse_mode="HTML",
+            )
+            logger.info(
+                "clarify reply after dead-man resume: task_id=%s bucket=%s",
+                task_id, bucket,
+            )
+            return True
         await update.message.reply_text(
             f"🚫 эта задача уже закрыта ({bucket}/{stage}), ответ не принят.\n"
             f"Задача <code>{task_id}</code>. Нужен новый прогон — "
@@ -3605,6 +3618,7 @@ async def run_all() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("projects", projects_command))
+    app.add_handler(CommandHandler("backend", backend_command))
     app.add_handler(CommandHandler("refresh_code", refresh_code_command))
     app.add_handler(CommandHandler("stt", stt_command))
     app.add_handler(CommandHandler("tasks", tasks_command))

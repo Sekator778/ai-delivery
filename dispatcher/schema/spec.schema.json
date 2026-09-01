@@ -53,18 +53,24 @@
       "default": 3
     },
     "model_routing": {
-      "description": "Per-stage backend selection. Defaults follow PHASE-5-DESIGN §3: BA and Architect on Opus (anthropic), the rest on DeepSeek. GLM-5.1 (z.ai) is available as third fallback; the rate-limit recovery menu in bot.py exposes switch buttons across all three. Override per-task if the prompt warrants a different mix.",
+      "description": "Per-stage backend selection. Defaults follow PHASE-5-DESIGN §3: BA and Architect on Opus (anthropic), the rest on DeepSeek. GLM-5.1 (z.ai) is available as third fallback; the rate-limit recovery menu in bot.py exposes switch buttons across all three. Override per-task if the prompt warrants a different mix. A value may name a key profile after a colon (\"deepseek:alt\"), selecting which key of that provider pays for the stage — see bot/providers.json and the ADR provider-key-profiles (T15). Without a registry the suffix resolves to the global key, i.e. today's behavior.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "discovery": {"enum": ["anthropic", "deepseek", "glm"], "default": "anthropic"},
-        "ba": {"enum": ["anthropic", "deepseek", "glm"], "default": "anthropic"},
-        "architect": {"enum": ["anthropic", "deepseek", "glm"], "default": "anthropic"},
-        "developer": {"enum": ["anthropic", "deepseek", "glm"], "default": "deepseek"},
-        "tester": {"enum": ["anthropic", "deepseek", "glm"], "default": "deepseek"},
-        "security": {"enum": ["anthropic", "deepseek", "glm"], "default": "deepseek"},
-        "reviewer": {"enum": ["anthropic", "deepseek", "glm"], "default": "deepseek"}
+        "discovery": {"type": "string", "pattern": "^(anthropic|deepseek|glm)(:[A-Za-z0-9._-]{1,64})?$", "default": "anthropic"},
+        "ba": {"type": "string", "pattern": "^(anthropic|deepseek|glm)(:[A-Za-z0-9._-]{1,64})?$", "default": "anthropic"},
+        "architect": {"type": "string", "pattern": "^(anthropic|deepseek|glm)(:[A-Za-z0-9._-]{1,64})?$", "default": "anthropic"},
+        "developer": {"type": "string", "pattern": "^(anthropic|deepseek|glm)(:[A-Za-z0-9._-]{1,64})?$", "default": "deepseek"},
+        "tester": {"type": "string", "pattern": "^(anthropic|deepseek|glm)(:[A-Za-z0-9._-]{1,64})?$", "default": "deepseek"},
+        "security": {"type": "string", "pattern": "^(anthropic|deepseek|glm)(:[A-Za-z0-9._-]{1,64})?$", "default": "deepseek"},
+        "reviewer": {"type": "string", "pattern": "^(anthropic|deepseek|glm)(:[A-Za-z0-9._-]{1,64})?$", "default": "deepseek"}
       }
+    },
+    "provider_profile": {
+      "description": "Which named key profile pays for each provider on this task (T15). Keyed by backend: {\"deepseek\": \"alt\"} makes every deepseek stage authenticate with the profile named 'alt' in bot/providers.json. Written by the bot from the operator's /backend selection; a per-stage suffix in model_routing (\"deepseek:alt\") overrides it. Ignored when the host has no registry.",
+      "type": "object",
+      "additionalProperties": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"},
+      "propertyNames": {"enum": ["anthropic", "deepseek", "glm"]}
     },
     "telegram_thread": {
       "description": "Telegram chat id + message id of the original request. Used to thread status updates back to the right conversation. Required when trigger=telegram (conditional enforced by allOf/if/then below). Optional for trigger=windmill and trigger=manual — supply it to opt into status threading; omit or set null to skip Telegram notifications for this task.",

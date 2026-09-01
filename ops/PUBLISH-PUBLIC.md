@@ -1,4 +1,12 @@
-# Publishing to the Public Mirror
+# Publishing to the Public Mirror — PAUSED
+
+> **Status (2026-08-21): publication is paused, the mirror is NOT gone.**
+> `github.com/Sekator778/ai-delivery` is live and public; current development
+> happens only in the private repository and the mirror is no longer refreshed.
+> Two things follow: do not run this flow on your own initiative — resuming is
+> the owner's decision — and **never `git push` to the mirror**, whatever a
+> clone's remotes happen to say. Everything below is the mechanism as built,
+> ready for the day publishing resumes.
 
 `scripts/publish-public.sh` is the single supported path for refreshing the
 public mirror (`github.com/Sekator778/ai-delivery`, remote `public-mirror`).
@@ -102,6 +110,42 @@ scripts/publish-public.sh --ref v1.0.0
 
 Defaults to `dev` when `--ref` is omitted.
 
+### Ref freshness
+
+The ref is checked against `origin` before anything is exported, and a ref that
+is not in sync aborts at preflight (`exit 2`):
+
+| State | Result |
+|---|---|
+| In sync with `origin/<ref>` | Proceeds, and says so |
+| Behind | Refuses — publishing would ship a stale tree |
+| Ahead | Refuses — those commits are not even in the private repo |
+| Diverged | Refuses — no publish from here is the whole branch |
+| `origin` unreachable | Refuses — freshness is unknown, not confirmed |
+| No `origin` remote, or `<ref>` not on `origin` | Proceeds, and says which |
+
+This exists because it already went wrong: public commit `19238a3` (2026-08-21)
+shipped a tree from a stale local `dev` under a summary describing changes that
+were not in it. Nothing warned, and the summary looked precise — it prints a
+SHA, just the wrong one.
+
+The check refuses rather than warns, which is the opposite of the choice made
+in `aidup` for the same class of problem. That is deliberate: a stand running
+yesterday's code beats a stand that will not start, and a human is watching the
+output. Publishing inverts both — it writes irreversibly to a live public
+repository, and nobody eyeballs the result.
+
+To publish from a ref that is knowingly out of sync — re-issuing an old tag,
+say:
+
+```bash
+scripts/publish-public.sh --ref v1.0.0 --allow-stale-ref
+```
+
+The override announces itself in the output. It is a flag and not an
+environment variable on purpose: the remote being compared against is a
+`readonly` constant, so there is no quiet way to turn the check off.
+
 ### Custom commit summary
 
 ```bash
@@ -170,7 +214,7 @@ personal information. Rotate the config before publishing from a different host.
 |---|---|
 | 0 | Success: published, dry-run completed, nothing to publish, or self-check ok |
 | 1 | Usage error (unknown flag) |
-| 2 | Preflight failure: invalid ref, missing gitleaks, missing blocklist, no tag, unauthorized `--push` |
+| 2 | Preflight failure: invalid ref, ref not in sync with `origin`, missing gitleaks, missing blocklist, no tag, unauthorized `--push` |
 | 3 | Gate finding: secrets or PII in export or commit message |
 | 4 | Push or verification failure |
 

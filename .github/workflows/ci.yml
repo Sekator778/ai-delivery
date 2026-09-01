@@ -1,0 +1,241 @@
+# CI for ai-delivery (private upstream).
+#
+# What this gate is and is not. It runs the same suite a contributor runs
+# locally — `python -m unittest discover -s tests` — plus a shell syntax check
+# and a secret scan of what the change adds. It does NOT build or deploy
+# anything: this project has no build artifact, and delivery is the pipeline's
+# own Tester stage plus the operator's smoke gate, not GitHub Actions.
+#
+# Not published to the mirror. `.github/` is deliberately absent from
+# PUBLIC_TOPLEVEL in scripts/publish-public.sh, so this file stays private
+# until that is a deliberate decision — which is exactly what the fail-closed
+# top-level filter is for. Adding `.github` to that list is the whole change
+# if CI on the public repo is wanted.
+name: CI
+
+on:
+  pull_request:
+  push:
+    # master too, and it matters more than it looks: master is the repository
+    # default — what a fresh clone, a new session and any trigger start from —
+    # and dev is merged into it whenever work lands, not only at a tag. The
+    # branch things run from is the last one that should go unchecked.
+    branches: [dev, master]
+  workflow_dispatch:
+
+# Least privilege: nothing here writes to the repo, opens a PR, or publishes.
+permissions:
+  contents: read
+
+# A new push supersedes the run in flight for the same ref. Actions minutes are
+# billed on a private repo, so do not pay twice for a branch nobody is reading.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Actions are pinned by major tag. These majors are the Node 24 line: v4
+  # checkout / v5 setup-python emitted a Node 20 deprecation warning on every
+  # run (GitHub was already forcing them onto Node 24). Bumped 2026-08-21.
+  #
+  # Pinned, not "latest": a moving scanner turns an unrelated PR red when
+  # upstream adds a rule. Bump deliberately, together with the checksum.
+  GITLEAKS_VERSION: "8.28.0"
+  GITLEAKS_SHA256: "a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb"
+
+jobs:
+  tests:
+    name: suite (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # Report every version, do not cancel siblings on the first red — the
+      # interesting case is "3.10 only", and fail-fast hides it.
+      fail-fast: false
+      matrix:
+        # The documented floor (ops/INSTALL.md assumes 3.10+) and what atlas
+        # actually runs (bot/venv is 3.12). 3.11 and 3.13 were verified green
+        # too; they are left out to keep billed minutes down, not because they
+        # are unsupported.
+        python: ["3.10", "3.12"]
+    env:
+      # Belt on top of memory_inject._is_ephemeral_target: CI must never reach
+      # a memory store, and an explicit off is cheaper to read than a guard.
+      MEMORY_WRITEBACK_ENABLED: "0"
+      MEMORY_INJECT_ENABLED: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # Full history + tags is a hard requirement, not a nicety:
+          # scripts/publish-public.sh refuses to run without a reachable
+          # version tag, so tests/test_publish_public.py goes red on a
+          # shallow clone.
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install gitleaks (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o /tmp/gitleaks.tar.gz "$url"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Install Python dependencies
+        run: |
+          set -euo pipefail
+          # Only jsonschema. The suite needs nothing else, and installing all of
+          # bot/requirements.txt (fastembed, aiohttp, python-telegram-bot) would
+          # add minutes and a flake surface for zero coverage. Version pinned to
+          # the one in bot/requirements.txt so CI and atlas agree.
+          python -m pip install --disable-pip-version-check --quiet jsonschema==4.23.0
+
+      - name: Configure git identity
+        # Several tests build throwaway repos and commit in them. They set a
+        # per-repo identity, but a global one keeps any future fixture that
+        # forgets from failing with a confusing "empty ident name".
+        run: |
+          git config --global user.email "ci@ai-delivery.invalid"
+          git config --global user.name "ai-delivery CI"
+
+      - name: Run the suite
+        run: |
+          set -euo pipefail
+          # pytest is NOT interchangeable here: two pytest-style files are not
+          # collected by discover, and the baselines this project quotes are
+          # unittest numbers. See memory-bank/ai-delivery/conventions.md.
+          python -m unittest discover -s tests 2>&1 | tee suite.log
+
+      - name: Upload suite log
+        # The suite prints pipeline logs after its own summary, so a failure is
+        # easier to read as a file than in the step output.
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: suite-log-py${{ matrix.python }}
+          path: suite.log
+          retention-days: 7
+
+  shell:
+    name: shell syntax + shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: bash -n every tracked shell script
+        run: |
+          set -euo pipefail
+          # Syntax first: a parse error makes shellcheck's output noise.
+          fail=0
+          while IFS= read -r f; do
+            if bash -n "$f"; then
+              echo "ok   $f"
+            else
+              echo "FAIL $f"
+              fail=1
+            fi
+          done < <(git ls-files '*.sh' 'scripts/git-hooks/*')
+          exit "$fail"
+
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          # Blocking at severity=warning, which is where the findings that
+          # turned out to be real live. The triage that the earlier version of
+          # this job deferred has been done: every warning and error in the
+          # tree was read and either fixed or given an inline `# shellcheck
+          # disable=` with a reason. One of them was a latent bug — a single
+          # `local a="$1" b="...$a..."` in aidstack.sh, where the right-hand
+          # sides are all evaluated before any assignment lands, so "$a" was
+          # the caller's variable and the daemon pidfile path only resolved
+          # because both call sites happened to use the same loop-variable
+          # name (SC2318).
+          #
+          # `info` and `style` are NOT blocking. They are dominated here by
+          # SC1091 (not following sourced files, which needs a runtime PATH),
+          # SC2015 (`a && b || c`, an idiom this codebase uses deliberately)
+          # and SC2317 (unreachable code, which misfires on trap handlers).
+          # A gate nobody can keep green is a gate everyone learns to ignore.
+          #
+          # research/external/ is excluded: it is vendor material kept for
+          # reference, not code this project maintains.
+          shellcheck --version
+          mapfile -t files < <(git ls-files '*.sh' 'scripts/git-hooks/*' \
+                                 | grep -v '^research/external/')
+          echo "checking ${#files[@]} scripts at severity=warning"
+          shellcheck --severity=warning --format=gcc "${files[@]}"
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o /tmp/gitleaks.tar.gz "$url"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Scan the working tree
+        # Catches "a secret is in the files as they stand". Verified clean on
+        # dev at the time this workflow was added.
+        run: gitleaks detect --source . --no-git --no-banner --redact
+
+      - name: Scan the commits this change adds
+        # Catches "a secret was added and then deleted within the same branch",
+        # which the tree scan cannot see. Kept alongside the full-history scan
+        # below because it names the offending commit inside THIS change, which
+        # is what the author needs in order to fix it.
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "No usable base commit (new branch or force-push) — the"
+            echo "working-tree scan above already covered the current files."
+            exit 0
+          fi
+          echo "Scanning ${base}..${head}"
+          gitleaks detect --source . --no-banner --redact --log-opts="${base}..${head}"
+
+      - name: Scan the whole history
+        # Switched on 2026-08-31. It was deliberately off while six historical
+        # findings would have made it red forever — the reasoning being that a
+        # permanently red job teaches everyone to ignore it.
+        #
+        # Triaged, those six turned out to be two things, and neither is a live
+        # credential: one real DeepSeek key, rotated 2026-05-27, and one regex
+        # false positive matched five times — a 40-hex git commit SHA inside a
+        # github.com/.../commit/<sha> URL in a pasted chat export, read as a
+        # Sourcegraph token. Both are pinned by fingerprint in .gitleaksignore,
+        # each with the sentence that justifies it.
+        #
+        # Blocking, and that is the point: the next finding in history will be
+        # a new one. It also closes a hole the incremental scan cannot — a
+        # secret arriving on a branch whose base is unavailable (force-push, a
+        # re-created branch), where the step above exits 0 by design.
+        run: gitleaks detect --source . --no-banner --redact

@@ -9,16 +9,41 @@ CLARIFY_INTERACTIVE_ENABLED=1); the bot reads the payload, sends an inline
 prompt, collects the reply, writes the answers to `clarifications.md` in the
 task dir, and bounces the task back to `tasks/inbox/` so the dispatcher
 re-ingests it. On the second pass BA reads `clarifications.md` and proceeds.
+
+Dead man (T10, 2026-08-21): nobody is obliged to answer. On 2026-08-17 both live
+tasks stood in the clarify pause for ~3 hours because the questions went
+unnoticed in Telegram, and the answers the operator eventually gave were the BA's
+own defaults — which the spec-kit contract requires every [NEEDS CLARIFICATION]
+marker to carry. The helpers below let the watcher resume such a task by ITSELF
+after CLARIFY_DEADMAN_HOURS, writing "no answer, use your defaults" into the same
+clarifications.md the operator would have written. Default 0 = off; the decision
+logic here is pure so the watcher sweep stays a thin I/O shell.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 MAX_QUESTIONS = 5
+
+# ── Dead-man resume (T10) ───────────────────────────────────────────────────
+# state.stage while the task waits for the operator. NOT a bucket: the task dir
+# lives in awaiting-input/, this label only says why it is there. The watcher
+# treats it as terminal (deliberately, fix 2026-06-01) — the sweep below is the
+# only thing that may move it, and only when the dead man is armed.
+PAUSED_STAGE = "awaiting_clarify"
+# Bumped by the watcher when it resumes a task on defaults; carried across
+# re-ingest by task_dispatcher._write_state_json.
+AUTO_RESUME_COUNTER = "clarify_auto_resumes"
+# ONE auto-resume per task, ever. A second clarify pause on the same task means
+# the BA asked again after seeing the defaults — that is a human's call, and
+# looping on defaults would answer the same questions with the same answers.
+AUTO_RESUME_LIMIT = 1
 
 _MARKER_RE = re.compile(r"\[NEEDS CLARIFICATION:\s*([^\]]*)\]")
 # A bare LABEL (Q1, Q12, 1, A) — not the question itself. When the bracket holds
@@ -176,6 +201,113 @@ def parse_reply_answers(reply_text: str, expected_count: int) -> list[str]:
     out = lines[:expected_count]
     out.extend([""] * (expected_count - len(out)))
     return out
+
+
+def deadman_hours() -> float:
+    """Hours to wait for the operator before resuming on BA defaults.
+
+    ``CLARIFY_DEADMAN_HOURS``; 0 (the default) disables the dead man entirely,
+    so an install that does not opt in behaves exactly as before. A malformed or
+    negative value reads as 0 — the fail-safe direction is "keep waiting for the
+    human", never "resume sooner than asked"."""
+    raw = (os.environ.get("CLARIFY_DEADMAN_HOURS") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        hours = float(raw)
+    except ValueError:
+        return 0.0
+    return hours if hours > 0 else 0.0
+
+
+def now_iso() -> str:
+    """UTC stamp in the shape the state fields use (ISO-8601, seconds)."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _iso_to_epoch(value: object) -> float | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.timestamp()
+
+
+def paused_at_epoch(state: dict | None, task_dir: Path) -> float | None:
+    """When this task entered the clarify pause, in epoch seconds.
+
+    Two sources, both stamped AT pause time: ``state.clarify_paused_at`` (written
+    by the runner's pause) and the ``created_at`` of the pending-questions
+    payload (written here, and present on tasks parked before the dead man
+    existed). Deliberately NOT the state.json mtime — re-ingest rewrites that
+    file with carried-forward fields, which would silently reset the clock.
+
+    None when neither stamp is readable; the caller must then leave the task
+    waiting for a human rather than guess its age."""
+    epoch = _iso_to_epoch((state or {}).get("clarify_paused_at"))
+    if epoch is not None:
+        return epoch
+    try:
+        payload = json.loads((task_dir / "clarifications-pending.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return _iso_to_epoch(payload.get("created_at"))
+
+
+def deadman_due(state: dict | None, task_dir: Path,
+                now: float | None = None) -> bool:
+    """Pure decision for the watcher sweep: may this parked task be resumed on
+    the BA's own defaults? True only when the dead man is armed, the task really
+    is in the clarify pause, it has never been auto-resumed, and its wait has
+    run past the deadline."""
+    hours = deadman_hours()
+    if hours <= 0:
+        return False
+    st = state or {}
+    if str(st.get("stage") or "") != PAUSED_STAGE:
+        return False
+    if int(st.get(AUTO_RESUME_COUNTER) or 0) >= AUTO_RESUME_LIMIT:
+        return False
+    paused_at = paused_at_epoch(st, task_dir)
+    if paused_at is None:
+        return False
+    now = time.time() if now is None else now
+    return (now - paused_at) >= hours * 3600.0
+
+
+def pending_questions(state: dict | None, task_dir: Path) -> list[str]:
+    """The questions this task is parked on. state.clarify_pending first (the
+    runner writes it with the pause), the payload file as the fallback."""
+    questions = ((state or {}).get("clarify_pending") or {}).get("questions")
+    if isinstance(questions, list) and questions:
+        return [str(q) for q in questions]
+    try:
+        payload = json.loads((task_dir / "clarifications-pending.json").read_text())
+    except (OSError, ValueError):
+        return []
+    return [str(item.get("question") or "") for item in (payload.get("questions") or [])
+            if str(item.get("question") or "").strip()]
+
+
+def default_answers(questions: list[str], hours: float) -> list[dict]:
+    """Q→A pairs recording "nobody answered; use the default you proposed".
+
+    The answer text is what BA reads on re-ingest, so it points BA back at its
+    OWN recorded default rather than inventing one here — the spec-kit contract
+    requires every [NEEDS CLARIFICATION] marker to carry a reasonable default,
+    and that default is the thing the operator would have confirmed anyway."""
+    waited = f"{hours:g}"
+    answer = (
+        f"No operator answer within {waited}h — proceed with the reasonable "
+        f"default this marker already records in the BRD, and state the chosen "
+        f"default explicitly in the resolved requirement. "
+        f"(Automatic resume by the clarify dead man; no human confirmed this.)"
+    )
+    return [{"question": q, "answer": answer} for q in questions]
 
 
 def _smoke() -> None:

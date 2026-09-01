@@ -92,8 +92,58 @@ M_EXTRA: tuple[str, ...] = ("ba",)
 #    deterministic, and dominates). Matched against candidate file paths AND the
 #    raw task text, case-insensitively. Any hit ⇒ risk=high ⇒ force full. ──
 RISK_PATTERNS: dict[str, str] = {
-    "auth": r"\b(auth|authn|authz|login|logout|oauth|sso|session|"
-            r"password|passwd|credential|token|jwt|rbac|acl|permission|"
+    # Bare `session`/`sessions` narrowed to auth-qualified phrases 2026-08-21,
+    # same class as the `secret` removal below. This project's own vocabulary is
+    # full of harmless sessions — Claude sessions, tmux sessions, the 5-hour
+    # session limit, a per-stage session id — and one of them ("own session per
+    # child", issue #20) was the ONLY auth hit on the reaping task. Hard risk
+    # dominates, so that single word forced tier=L: every stage on Anthropic
+    # instead of DeepSeek, and a $10.86 cap stop. Real auth sessions still match:
+    # `session cookie` / `session fixation` / `session hijacking` / `session
+    # replay` here, and `session token` / `session credential` through the
+    # neighbor words they carry.
+    # Bare `permission` narrowed 2026-08-28 (backlog/T19) — fifth of the same
+    # class. This repo lives inside Claude Code, where permission is harness
+    # vocabulary, not authentication: `--dangerously-skip-permissions`,
+    # "reduce permission prompts", "the permission classifier blocked the
+    # delete", "check file permissions on the worktree" — and
+    # `permissions: contents: read`, a line from this project's own CI
+    # workflow. Seven of eight such lines came back risk=auth, and auth is a
+    # HARD flag, so each one forced tier=L on its own. It now needs an auth
+    # neighbour on one side. `rbac` and `acl` still match bare — they are
+    # unambiguous. `privilege escalation` is added rather than preserved: it
+    # did NOT match before this change (there was no `privilege` in the
+    # alternation at all), which the brief assumed otherwise.
+    #
+    # `check`/`checks` is deliberately NOT an accepted right-hand neighbour.
+    # "permission check" is as much harness vocabulary here as auth vocabulary,
+    # and there is no way to tell them apart in a regex; under-matching one
+    # phrase beats keeping the false positive that motivated the whole change.
+    # Bare `token` narrowed 2026-08-22 (backlog/T18) — fourth of the same class,
+    # after `secret`, `session` and the payment words. In THIS project "token" is
+    # the unit of the budget, not a credential: token_cap, "token budget",
+    # "input/output tokens", "500k tokens", the tokenizer. T08 is an entire brief
+    # about the token cap. auth is a HARD flag, so one such word forced tier=L —
+    # the line "tokens, not dollars, are the budget unit on a subscription", from
+    # our own test docstring, came back risk=auth. It now needs an auth-side
+    # neighbour on one side or the other. The unambiguous words (oauth, jwt,
+    # credential, password, sso, login) still match bare and carry most real auth
+    # text anyway, including "JWT token" and "session token".
+    "auth": r"\b(auth|authn|authz|login|logout|oauth|sso|"
+            r"session[\s_-]?(?:cookie|fixation|hijack|replay)|"
+            r"(?:access|refresh|bearer|auth|authorization|session|id|csrf|xsrf|"
+            r"api|reset|verification|invite|signed|bot|oauth)[\s_-]tokens?|"
+            r"personal[\s_-]access[\s_-]tokens?|"
+            r"tokens?[\s_-](?:revocations?|revoke|rotations?|rotate|expiry|"
+            r"expiration|refresh|validation|validate|verify|issuance|issue|"
+            r"leak|theft|scopes?|secrets?|store|storage|exchange|blacklist|"
+            r"introspection|endpoint|header)|"
+            r"password|passwd|credential|jwt|rbac|acl|"
+            r"privilege[\s_-]?escalation|"
+            r"(?:user|users|access|admin|role|roles|grant|granted|api|oauth|"
+            r"scope|scoped|elevated|root)[\s_-]permissions?|"
+            r"permissions?[\s_-](?:escalation|elevation|grant|granted|grants|"
+            r"revoke|revoked|revocation|model|boundary|boundaries|bypass)|"
             r"authoriz|authentic)\w*",
     # Bare `secret`/`secrets` removed 2026-06-07: too noisy
     # ("CI ... no repository secrets", "secret menu", "open secret" all forced
@@ -108,8 +158,26 @@ RISK_PATTERNS: dict[str, str] = {
                  r"\bddl\b|flyway|liquibase|alembic|schema\s+change)",
     "ci_cd": r"(\.github/workflows|\.gitlab-ci|jenkinsfile|\.circleci|"
              r"/ci/|/cd/|\bdeploy\b|pipeline\.ya?ml|release\.ya?ml)",
-    "payment": r"\b(payment|billing|invoice|charge|stripe|paypal|braintree|"
-               r"checkout|refund|ledger|payout|subscription)\w*",
+    # Bare `checkout`, `subscription`, `ledger` and `charge` removed 2026-08-21
+    # (backlog/T14, same class as `secret` in June and `session` in T09): all four
+    # are everyday vocabulary HERE — "git checkout -b", the Anthropic
+    # subscription window, the cost ledger this repo writes per stage
+    # (cost_ledger.py, ops/cost-report.py), "the CLI charges every session at
+    # Anthropic rates". payment is a HARD risk flag, so one such word forced
+    # tier=L on any self-target task that mentioned them — the way a single
+    # "session" did to the reaping task ($10.86 cap death, 2026-08-17). Each now
+    # needs a payment-side qualifier; the unambiguous words (payment, billing,
+    # invoice, stripe, paypal, braintree, refund, payout, chargeback) still match
+    # bare, and a real phrase like "subscription billing" or "Stripe checkout"
+    # keeps matching through those anyway.
+    "payment": r"\b(payment|billing|invoice|stripe|paypal|braintree|refund|"
+               r"payout|chargeback|"
+               r"checkout[\s_-]?(?:page|flow|form|cart|funnel|session)|"
+               r"subscription[\s_-]?(?:billing|fee|renewal|charge|payment|invoice)|"
+               r"(?:general|payment)[\s_-]?ledger|"
+               r"ledger[\s_-]?(?:entry|entries|balance|account)|"
+               r"charge[\s_-]?(?:the[\s_-])?(?:card|customer|account)|"
+               r"card[\s_-]?charge)\w*",
     "infra": r"\b(dockerfile|docker-compose|kubernetes|k8s|terraform|helm|"
              r"ansible|systemd|nginx|iptables|firewall)\w*",
 }

@@ -46,7 +46,12 @@ class PreScanTests(unittest.TestCase):
             ("add a login check to auth/session.py", "auth"),
             ("encrypt the token before storing", "crypto"),
             ("write a DB migration to alter table users", "migration"),
-            ("update the billing/checkout charge flow", "payment"),
+            # Was "update the billing/checkout charge flow" — which _mask_identifiers
+            # ate as a path ("billing/checkout"), so the flag actually came from the
+            # bare `charge`. T14 narrowed that word (it is how "the CLI charges every
+            # session" forced tier=L), so the fixture now uses payment vocabulary
+            # that survives masking.
+            ("fix the Stripe checkout flow", "payment"),
             ("tweak .github/workflows/ci.yml", "ci_cd"),
         ]:
             pre = t.prescan(text, None)
@@ -135,6 +140,108 @@ class IdentifierMaskingTests(unittest.TestCase):
         pre = t.prescan("add a login check to auth/session.py", None)
         self.assertEqual(pre.risk, "high")
         self.assertIn("auth", pre.risk_flags)
+
+
+class RiskWordNarrowingTests(unittest.TestCase):
+    """The recurring failure mode: a bare risk word that is ordinary vocabulary
+    HERE forces tier=L, because auth is a HARD flag one match dominates.
+
+    Five words have been narrowed for this reason — `secret` (2026-06-07),
+    `session` (T09), the payment words (T14), `token` (T18) and `permission`
+    (T19). Only the last arrived with tests; the first four were narrowed in
+    the regex with explanatory comments and pinned by nothing, so re-widening
+    any of them would have gone unnoticed. Both directions are asserted here:
+    the project's own vocabulary must stay clean, and real security work must
+    still be caught. Under-matching a rare phrase is acceptable; a false L is
+    every stage on Anthropic and L-sized caps.
+    """
+
+    def _flags(self, text: str) -> list[str]:
+        return t.prescan(text, None).risk_flags
+
+    # -- T19: permission ----------------------------------------------------
+    HARNESS_PERMISSION = [
+        "run claude with --dangerously-skip-permissions",
+        "permissions: contents: read in the workflow",   # our own ci.yml
+        "reduce permission prompts in the session",
+        "check file permissions on the worktree",
+        "the permission classifier blocked the delete",
+        "add a permission prompt for destructive commands",
+        "fix directory permissions after checkout",
+        "the harness asks permission before each edit",
+        "chmod the script, its permissions are wrong",
+    ]
+    AUTH_PERMISSION = [
+        "privilege escalation in the admin panel",
+        "grant admin permission to the service account",
+        "permission bypass in the API layer",
+        "add RBAC roles and permissions",
+        "ACL check on the bucket",
+        "user permissions are not revoked on logout",
+        "role permission model needs a rewrite",
+        "elevated permissions for the installer",
+        "oauth scope permissions are too wide",
+    ]
+
+    def test_harness_permission_vocabulary_is_not_auth(self) -> None:
+        for text in self.HARNESS_PERMISSION:
+            self.assertNotIn("auth", self._flags(text),
+                             f"{text!r} — harness vocabulary forced an auth flag")
+
+    def test_real_permission_work_is_still_auth(self) -> None:
+        for text in self.AUTH_PERMISSION:
+            self.assertIn("auth", self._flags(text),
+                          f"{text!r} — real auth work lost its flag")
+
+    # -- T18: token ---------------------------------------------------------
+    def test_budget_token_vocabulary_is_not_auth(self) -> None:
+        for text in [
+            "tokens, not dollars, are the budget unit on a subscription",
+            "raise the token cap for the developer stage",
+            "the stage burned 500k tokens before parking",
+            "count input and output tokens per stage",
+        ]:
+            self.assertNotIn("auth", self._flags(text), text)
+
+    def test_credential_tokens_are_still_auth(self) -> None:
+        for text in [
+            "rotate the api token in the vault",
+            "the access token leaks into the log",
+            "add refresh token revocation",
+            "validate the JWT before trusting it",
+        ]:
+            self.assertIn("auth", self._flags(text), text)
+
+    # -- T09: session -------------------------------------------------------
+    def test_ordinary_session_vocabulary_is_not_auth(self) -> None:
+        for text in [
+            "give each child its own session per stage",
+            "the 5-hour session limit was reached",
+            "resume the tmux session after reboot",
+        ]:
+            self.assertNotIn("auth", self._flags(text), text)
+
+    def test_real_session_attacks_are_still_auth(self) -> None:
+        for text in [
+            "fix session fixation on login",
+            "session hijacking via the cookie",
+        ]:
+            self.assertIn("auth", self._flags(text), text)
+
+    # -- T14: payment / 2026-06-07: secret ----------------------------------
+    def test_our_own_vocabulary_is_not_payment_or_auth(self) -> None:
+        for text, flag in [
+            ("the CLI charges every session at Anthropic rates", "payment"),
+            ("CI on GitHub uses no repository secrets", "auth"),
+        ]:
+            self.assertNotIn(flag, self._flags(text), text)
+
+    def test_real_payment_work_is_still_payment(self) -> None:
+        for text in [
+            "fix the Stripe checkout flow",
+            "handle the chargeback webhook",
+        ]:
+            self.assertIn("payment", self._flags(text), text)
 
 
 class ClassifyTableTests(unittest.TestCase):
@@ -585,7 +692,12 @@ class TokenGovernorTests(_SilenceSideEffects):
         self.assertEqual(sra._add_tokens_used(d, 500), 1500)
 
     def test_enforces_cap_when_acting(self) -> None:
+        """A cap stop is an operator gate, not a crash (T08): the stop parks the
+        task through budget_gate instead of writing stage="failed"."""
         os.environ["TRIAGE_MODE"] = "s-only"
+        parked: list[dict] = []
+        real_park = sra._park_budget_stop
+        sra._park_budget_stop = lambda *a, **kw: parked.append(kw)
         try:
             d = Path(tempfile.mkdtemp())
             (d / "state.json").write_text(json.dumps(
@@ -593,8 +705,12 @@ class TokenGovernorTests(_SilenceSideEffects):
             ))
             self._seed_stage_tokens(d, "developer", 13282)  # over the 10k cap
             self.assertTrue(sra._token_cap_exceeded(d, {}, "developer", "T"))
-            self.assertEqual(json.loads((d / "state.json").read_text())["stage"], "failed")
+            self.assertEqual(len(parked), 1)
+            self.assertEqual(parked[0]["stop_reason"], "token_cap")
+            self.assertNotEqual(
+                json.loads((d / "state.json").read_text()).get("stage"), "failed")
         finally:
+            sra._park_budget_stop = real_park
             os.environ.pop("TRIAGE_MODE", None)
 
     def test_tracks_but_does_not_enforce_in_shadow(self) -> None:

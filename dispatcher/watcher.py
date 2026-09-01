@@ -32,8 +32,15 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import clarify as _clarify
 import limit_stall as _limit_stall
 import proc_reaper as _proc_reaper
+# T24: the "is a runner alive" predicate moved to runner_liveness.py so that
+# ops/atlas/aidstack.sh can ask the same question before restarting or stopping
+# the stack. A second, shell-shaped definition would drift from this one.
+from runner_liveness import RUNNER_SCRIPT_NAMES as _RUNNER_SCRIPT_NAMES
+from runner_liveness import pid_is_alive as _pid_is_alive
+from runner_liveness import runner_is_dead as _runner_is_dead
 from runner_state import _append_history, _update_state
 from telegram_io import _notify_bot, _send_telegram
 
@@ -95,8 +102,6 @@ _load_env_file_into(_RUNNER_ENV)
 # subprocess runner + the STAGE_RUNNER_MODE switch were removed). The watcher
 # respawns exactly the script the dispatcher spawns.
 STAGE_RUNNER_SCRIPT = str(REPO_ROOT / "dispatcher" / "stage_runner_agent.py")
-_RUNNER_SCRIPT_NAMES = ("stage_runner_agent.py",)
-
 POLL_INTERVAL = int(os.environ.get("WATCHER_POLL_INTERVAL", "15"))
 MAX_RESPAWN = int(os.environ.get("WATCHER_MAX_RESPAWN", "3"))
 MIN_ARTIFACT_SIZE = int(os.environ.get("WATCHER_MIN_ARTIFACT_SIZE", "50"))
@@ -215,34 +220,6 @@ _last_orphan_sweep_ts = 0.0
 # ---------------------------------------------------------------------------
 
 
-def _pid_is_alive(pid: int, expected_task_id: str) -> bool:
-    """Check whether *pid* is a live stage_runner for *expected_task_id*."""
-    try:
-        os.kill(pid, 0)
-    except (OSError, ProcessLookupError):
-        return False
-
-    # Portable cmdline read: /proc/{pid}/cmdline is Linux-only (no procfs on
-    # macOS). `ps -o command=` reports the full command line on both Linux and
-    # macOS, so shell out instead of reading procfs directly.
-    try:
-        cmdline = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
-            capture_output=True, text=True, timeout=5,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
-
-    if not cmdline.strip():
-        return False
-
-    parts = cmdline.split()
-    return (
-        any(name in cmdline for name in _RUNNER_SCRIPT_NAMES)
-        and any(expected_task_id in p for p in parts)
-    )
-
-
 def _read_state(task_dir: Path) -> Optional[dict]:
     """Parse state.json, return None on any error."""
     try:
@@ -312,19 +289,6 @@ def _terminal_bucket_for(stage: str) -> Optional[Path]:
     if stage == "failed" or stage.startswith("failed:"):
         return FAILED_DIR
     return None
-
-
-def _runner_is_dead(task_dir: Path, task_id: str) -> bool:
-    """True when no live runner owns this task (dead / absent .runner.pid)."""
-    pid_file = task_dir / ".runner.pid"
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            if _pid_is_alive(pid, task_id):
-                return False
-        except (ValueError, OSError):
-            pass
-    return True
 
 
 def _reconcile_terminal_in_active(task_dir: Path, stage: str, task_id: str) -> bool:
@@ -505,6 +469,74 @@ def scan_limit_parked_for_resume() -> None:
                 log.info("[%s] limit-park: resume_at passed → inbox/", entry.name)
         except Exception:  # noqa: BLE001 — one bad task must not kill the sweep
             log.exception("[%s] limit-park: unexpected failure", entry.name)
+
+
+def scan_clarify_deadman() -> None:
+    """Resume clarify-paused tasks nobody answered (T10).
+
+    The clarify pause has no timeout: ``awaiting_clarify`` is terminal for this
+    watcher (deliberately, fix 2026-06-01), so a task whose questions went
+    unnoticed in Telegram waits forever — on 2026-08-17 both live tasks stood
+    ~3 hours and the answers they finally got were the BA's own defaults. With
+    ``CLARIFY_DEADMAN_HOURS`` set, this sweep writes those defaults into the same
+    ``clarifications.md`` the operator would have written, and requeues the task.
+
+    OFF by default (0 hours) — an install that does not opt in never reaches the
+    body of the loop. One auto-resume per task, enforced in ``deadman_due`` and
+    counted in ``state.clarify_auto_resumes`` (carried across re-ingest by the
+    dispatcher), so a SECOND clarify pause on the same task waits for a human
+    again instead of answering itself in a circle. Never raises."""
+    hours = _clarify.deadman_hours()
+    if hours <= 0 or not AWAITING_INPUT_DIR.is_dir():
+        return
+    for entry in sorted(AWAITING_INPUT_DIR.iterdir()):
+        if not entry.is_dir():
+            continue
+        task_id = entry.name
+        state = _read_state(entry)
+        if state is None:
+            continue
+        try:
+            if not _clarify.deadman_due(state, entry):
+                continue
+            questions = _clarify.pending_questions(state, entry)
+            if not questions:
+                # Parked with no recoverable questions: there is nothing to
+                # answer on the task's behalf, and inventing a resume would send
+                # BA back in with the same unresolved markers. Leave it.
+                log.warning("[%s] clarify dead man: no pending questions found "
+                            "— leaving it for the operator", task_id)
+                continue
+            _clarify.append_answers(
+                entry, _clarify.default_answers(questions, hours))
+            state.pop("clarify_pending", None)
+            state["clarify_deadman"] = {
+                "resumed_at": _clarify.now_iso(),
+                "waited_hours": hours,
+                "questions": len(questions),
+            }
+            try:
+                (entry / "clarifications-pending.json").unlink()
+            except OSError:
+                pass
+            state["stage"] = "inbox"
+            if not _requeue_to_inbox(
+                    entry, task_id, state,
+                    counter=_clarify.AUTO_RESUME_COUNTER,
+                    cause=f"clarify unanswered for {hours:g}h — resuming on BA defaults",
+                    limit=_clarify.AUTO_RESUME_LIMIT):
+                continue
+            log.warning("[%s] clarify dead man: %d question(s) unanswered for "
+                        "%gh → inbox/ on BA defaults", task_id, len(questions), hours)
+            _send_telegram(
+                f"[{task_id}] ⏭️ уточнения без ответа {hours:g} ч — продолжаю по "
+                f"дефолтам BA ({len(questions)} вопрос(а/ов)). Ответ на тот "
+                f"prompt больше не принимается; нужен другой ход — "
+                f"/requeue {task_id}.")
+            _notify_bot("clarify_deadman_resumed", task_id,
+                        waited_hours=hours, questions=len(questions))
+        except Exception:  # noqa: BLE001 — one bad task must not kill the sweep
+            log.exception("[%s] clarify dead man: unexpected failure", task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -803,6 +835,7 @@ def scan_orphans() -> None:
 
     scan_awaiting_input_for_transient_retry()
     scan_limit_parked_for_resume()
+    scan_clarify_deadman()
     scan_pr_reconciliation()
     sweep_orphan_children(force=True)
 
@@ -818,6 +851,10 @@ def monitor_loop() -> None:
 
         # Un-park limit-stalled tasks whose resume_at has passed (#11).
         scan_limit_parked_for_resume()
+
+        # Resume clarify-paused tasks nobody answered in time (T10; off unless
+        # CLARIFY_DEADMAN_HOURS is set).
+        scan_clarify_deadman()
 
         # Reconcile awaiting-approval tasks against GitHub PR state (throttled
         # internally to RECONCILE_INTERVAL_SEC — issue #4).

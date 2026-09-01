@@ -1,0 +1,12 @@
+# leak-watch markers — copy to ops/leak-watch-markers.local (gitignored) and
+# fill in strings that are UNIQUE to your private/corporate codebase.
+# One phrase per line; '#' starts a comment. Good markers: an internal JIRA
+# project key, a root Java package, a distinctive class name, an internal
+# hostname. Bad markers: anything a stranger's repo could contain by chance.
+#
+# ignore-repo: owner/name   suppresses a known false positive forever.
+
+ACME-PROJ                     # JIRA key — also catches commit messages
+com.acme.internalproduct      # root package
+AcmeFraudPipelineOrchestrator # distinctive class name
+ignore-repo: someone/unrelated-dictionary-dump

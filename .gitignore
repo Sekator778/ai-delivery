@@ -118,6 +118,18 @@ tasks/cancelled/*
 
 # Project registry — contains absolute host paths, per-deployment
 bot/projects.json
+# Provider key profiles (T15) — per-host names + pointers to keys, never the
+# keys themselves. bot/providers.example.json is the tracked template.
+bot/providers.json
+# The flat semantic store (T13) — the LIVE memory, 13 MB of vectors that
+# grow with every task's write-back. Not committed: it is regenerable from
+# the payload export through TEI, it is unreviewable in a diff, and it
+# would put a binary-shaped blob in every clone. See the ADR
+# flat-store-git-policy; the payload-only export beside it IS committed.
+memory-bank/semantic-export/*.vectors.jsonl
 
 # Operator's local PII/secret blocklist for publish-public.sh (gitignored by design)
 ops/publish-blocklist.local
+
+# Operator's leak-watch marker list (corporate-unique strings; gitignored by design)
+ops/leak-watch-markers.local

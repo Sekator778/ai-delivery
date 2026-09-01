@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import pipeline_config as _pipeline_config
+import provider_profiles as _profiles
 import triage as _triage
 from child_env import build_child_env
 from target_policy import _is_sandbox_target
@@ -312,7 +313,8 @@ def _apply_tier_model_routing(target_repo: Path, tier: "str | None",
               f"default (Opus)", file=sys.stderr)
 
 
-def _subagent_env(backend: str, stage: "str | None" = None) -> dict[str, str]:
+def _subagent_env(backend: str, stage: "str | None" = None, *,
+                  profile: "str | None" = None) -> dict[str, str]:
     """Build the subprocess env for a given backend label.
 
     Each non-anthropic backend rewrites ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL so
@@ -329,6 +331,14 @@ def _subagent_env(backend: str, stage: "str | None" = None) -> dict[str, str]:
     copy of os.environ: the child gets base system vars, the claude-harness
     vars, this backend's model/auth family and CHILD_ENV_EXTRA — never the
     bot token / Windmill / LangSmith / owner ids it has no use for.
+
+    ``profile`` selects a named key profile for this provider (T15). It only
+    does anything when bot/providers.json exists: the profile's key replaces
+    the global one, its base_url (when set) wins over both the default endpoint
+    and the LiteLLM proxy, and the backend's own ``*_API_KEY`` is dropped from
+    the child env — a stage running on the alt key has no business seeing the
+    main one. Without a registry the resolution returns None and every line
+    below behaves exactly as it did before profiles existed.
     """
     env = _child_env(backend)
     if backend == "anthropic":
@@ -353,11 +363,28 @@ def _subagent_env(backend: str, stage: "str | None" = None) -> dict[str, str]:
         return env
 
     if backend == "deepseek":
-        api_key = _os.environ.get("DEEPSEEK_API_KEY", "").strip()
+        prof = _profiles.resolve(backend, profile)
+        api_key = (prof.api_key if prof
+                   else _os.environ.get("DEEPSEEK_API_KEY", "").strip())
         if not api_key:
-            print("warn: DEEPSEEK_API_KEY not set — falling back to anthropic",
+            where = f"profile {prof.name}" if prof else "DEEPSEEK_API_KEY"
+            print(f"warn: no DeepSeek key from {where} — falling back to anthropic",
                   file=sys.stderr)
             return _child_env("anthropic")
+        if prof:
+            env.pop("DEEPSEEK_API_KEY", None)
+        if prof and prof.base_url:
+            env["ANTHROPIC_BASE_URL"] = prof.base_url
+            env["ANTHROPIC_AUTH_TOKEN"] = api_key
+            env["ANTHROPIC_MODEL"] = _os.environ.get(
+                "DEEPSEEK_MODEL_PRIMARY", "deepseek-v4-pro")
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = _os.environ.get(
+                "DEEPSEEK_MODEL_SONNET", "deepseek-v4-pro")
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = _os.environ.get(
+                "DEEPSEEK_MODEL_HAIKU", "deepseek-v4-flash")
+            env["CLAUDE_CODE_SUBAGENT_MODEL"] = _os.environ.get(
+                "DEEPSEEK_MODEL_SUBAGENT", "deepseek-v4-flash")
+            return env
         if LITELLM_PROXY_URL:
             if not LITELLM_MASTER_KEY:
                 print("warn: LITELLM_PROXY_URL set but LITELLM_MASTER_KEY missing "
@@ -396,11 +423,27 @@ def _subagent_env(backend: str, stage: "str | None" = None) -> dict[str, str]:
         return env
 
     if backend == "glm":
-        api_key = _os.environ.get("GLM_API_KEY", "").strip()
+        prof = _profiles.resolve(backend, profile)
+        api_key = (prof.api_key if prof
+                   else _os.environ.get("GLM_API_KEY", "").strip())
         if not api_key:
-            print("warn: GLM_API_KEY not set — falling back to anthropic",
+            where = f"profile {prof.name}" if prof else "GLM_API_KEY"
+            print(f"warn: no GLM key from {where} — falling back to anthropic",
                   file=sys.stderr)
             return _child_env("anthropic")
+        if prof:
+            env.pop("GLM_API_KEY", None)
+        if prof and prof.base_url:
+            env["ANTHROPIC_BASE_URL"] = prof.base_url
+            env["ANTHROPIC_AUTH_TOKEN"] = api_key
+            env["ANTHROPIC_MODEL"] = _os.environ.get("GLM_MODEL_PRIMARY", "glm-4.6")
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = _os.environ.get(
+                "GLM_MODEL_SONNET", "glm-4.6")
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = _os.environ.get(
+                "GLM_MODEL_HAIKU", "glm-4.5-flash")
+            env["CLAUDE_CODE_SUBAGENT_MODEL"] = _os.environ.get(
+                "GLM_MODEL_SUBAGENT", "glm-4.5-flash")
+            return env
         if LITELLM_PROXY_URL:
             if not LITELLM_MASTER_KEY:
                 print("warn: LITELLM_PROXY_URL set but LITELLM_MASTER_KEY missing "

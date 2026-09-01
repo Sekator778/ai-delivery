@@ -11,8 +11,9 @@ here as an idempotent script. Manual commands must not be the only record.
 
 | Script | Purpose |
 |---|---|
-| `publish-public.sh` | Gated, idempotent public-mirror publish. Exports a filtered git tree (private paths excluded), runs two independent secret/PII scans (gitleaks + project blocklist), builds one squash commit on the public mirror's `main`, and pushes only under an explicit `--push` flag. See [ops/PUBLISH-PUBLIC.md](PUBLISH-PUBLIC.md) for setup and usage. |
+| `publish-public.sh` | **PAUSED since 2026-08-21** — the mirror is live but no longer refreshed (development is private-only); resuming is the owner's decision, so do not run this on your own initiative. Gated, idempotent public-mirror publish. Exports a filtered git tree (private paths excluded), runs two independent secret/PII scans (gitleaks + project blocklist), builds one squash commit on the public mirror's `main`, and pushes only under an explicit `--push` flag. See [ops/PUBLISH-PUBLIC.md](PUBLISH-PUBLIC.md) for setup and usage. |
 | `install-wsl.sh` | One-shot idempotent install of the runtime: apt base packages, Docker Engine (native, not Docker Desktop), uv, Claude Code CLI, shell aliases, runtime symlinks, executable bits, .env validation, ollama model pulls. Re-running is safe — each step detects whether the work is already done. |
+| `cost-report.py` | Read-only slices over the per-stage cost ledger (`~/.ai-delivery/cost.db`, `COST_LEDGER_PATH`): spend per stage with each stage's share of the average task, spend per task with its triage tier, and the DeepSeek `computed:*` rows split into peak / off-peak so the price override can be calibrated on data. Markdown on stdout, `--csv DIR` for spreadsheets, `--task <id>` for one task stage by stage. Opens the database `mode=ro` and issues no writes. |
 | `claude-aliases.sh` | Shell functions `claude-deepseek` and `claude-anthropic` for routing the `claude` CLI to different model backends. Sourced from `~/.zshrc` and `~/.bashrc` by the installer. Mirror of the Windows PowerShell profile functions. |
 | `docker-prune.sh` | Safe weekly Docker cleanup: dangling/untagged images (`until=48h`, skips in-use + in-progress-build layers) + reclaimable BuildKit cache only. Never prunes tagged images, volumes, networks or containers. Installed as a systemd timer via `ops/install-docker-prune-timer.sh` (weekly, `Persistent=true`). |
 
@@ -75,3 +76,4 @@ current host are:
   DeepSeek key)
 
 Everything else is in git.
+- `ops/leak-watch.py` — poll GitHub public search for corporate-unique markers (from gitignored `ops/leak-watch-markers.local`), alert only on NEW verified hits. Weekly via `ops/leak-watch-launchd.plist.example`. See STATE/LEAK-HUNT-CHECKLIST.md.

@@ -85,6 +85,7 @@ repo map (§4): mem0 → voice → Windmill, ascending arm64 risk.
 
 ```bash
 ops/atlas/aidstack.sh up       # mem0 (Qdrant) + bot/venv + dispatcher + watcher (+ bot if configured)
+ops/atlas/aidstack.sh restart  # THE DEPLOY: down, then up — see below
 ops/atlas/aidstack.sh down     # stop daemons, stop mem0 (volumes kept), release the Docker engine if idle
 ops/atlas/aidstack.sh status   # daemon pidfile liveness + container status + qdrant and TEI health
 ops/atlas/aidstack.sh logs [dispatcher|watcher|bot]   # tail -f (default: dispatcher)
@@ -93,6 +94,85 @@ ops/atlas/aidstack.sh logs [dispatcher|watcher|bot]   # tail -f (default: dispat
 The bot only starts when `bot/.env` has a real `TELEGRAM_BOT_TOKEN` (not the
 `123456:ABC...` placeholder) — otherwise `up` warns and skips it. Dispatcher
 and watcher start unconditionally; they don't need the Telegram token.
+
+## Starting the stand is the deploy
+
+There is no scheduler, no agent and no background process. `aidup` takes the
+newest commit of the branch the checkout is on, then starts. If there is
+nothing new, or anything at all is in the way, it starts what is already
+checked out.
+
+```bash
+aidup                     # update if there is one, then start
+ops/atlas/aidstack.sh pull   # just the update step, no start
+AIDUP_PULL=0 aidup        # start without touching git
+```
+
+### `up` does not deploy to a stand that is already running
+
+`up` starts what is not running and deliberately never touches a live daemon.
+On a **cold** stand that is the deploy: nothing is running, so everything starts
+on the code just pulled. On a **live** stand it is not, and the difference is
+easy to miss:
+
+| | code it executes after `aidup` |
+|---|---|
+| dispatcher / watcher, already running | **old** — the modules they imported at start |
+| a stage spawned from now on | **new** — a fresh process reading the new files |
+| persona and prompt files | **new** — read from disk per stage |
+
+So the orchestrator and the stages it orchestrates end up on different versions
+of this repository. If a commit changes the contract between them — a
+`state.json` field, the handoff format, the stage argv — a task that straddles
+the pull breaks in a way that will not reproduce.
+
+`up` now warns when it pulled something while daemons were already up. To
+actually deploy:
+
+```bash
+ops/atlas/aidstack.sh restart --wait    # finish the current task, then restart
+ops/atlas/aidstack.sh restart           # restart now; refuses if a task is running
+ops/atlas/aidstack.sh restart --force   # restart over a running task, deliberately
+```
+
+### `restart` and `down` refuse while a task is running
+
+Both stop the daemons, and `down` also sweeps orphaned `claude` children — so
+either will kill a stage in flight. A stage killed halfway is a paid Claude
+call thrown away; the watcher resuming from `state.json` does not refund it.
+One fully green task cost $14.56 (`8f7619e`).
+
+They refuse when any task under `tasks/active/` has a live runner, naming the
+tasks and both ways forward. `--wait` polls until they finish
+(`AIDSTACK_WAIT_TIMEOUT`, default 3600s) and **refuses on timeout** rather than
+falling through to a kill — timing out into `--force` would be exactly the
+silent kill the guard exists to prevent.
+
+Liveness is answered by `dispatcher/runner_liveness.py`, the same module the
+watcher uses — it is not a `kill -0` in shell. A pidfile outlives its process
+and pids get reused, so the check also matches the process command line against
+the runner script and the task id. A shell approximation would call a recycled
+pid a live runner and block deploys forever, and could disagree with what the
+watcher believes about the same task.
+
+**The update never blocks the start.** Every obstacle is a warning, not a
+failure — dirty tree, unpushed local commits, diverged history, detached HEAD,
+no network. A stand that refuses to come up because git had an opinion is worse
+than a stand running last week's code, and you are standing right there reading
+the output.
+
+| Situation | What happens |
+|---|---|
+| remote branch moved ahead | fast-forward, then start |
+| nothing new | start |
+| uncommitted changes | keep them, start as is |
+| local branch ahead of origin | start as is (you have unpushed work) |
+| local and origin diverged | start as is, no guessing |
+| detached HEAD | start as is |
+| fetch failed (offline) | start as is |
+
+It follows whatever branch is checked out, so no branch name is configured in
+two places — on `dev` it takes `origin/dev`, on a release branch it takes that.
 
 ## Where logs and pids live
 

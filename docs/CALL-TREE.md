@@ -60,6 +60,12 @@ operator shell — aidup / aiddown / aidstatus (ops/claude-aliases.sh)
   died re-parents to init and keeps burning the subscription — 3h11m unnoticed
   on 2026-08-14 (#18). The matcher (ppid==1, no tty, both pipeline flags) can
   never select an interactive session.
+- **`down` and `restart` refuse while a task runner is live** (T24). That sweep
+  is what makes them destructive, so both ask `dispatcher/runner_liveness.py`
+  first and stop rather than kill a stage mid-flight; `--wait` waits, `--force`
+  overrides. `up` does *not* have this guard and does not need it — it never
+  touches a live daemon, which is also why it does not deploy to a running
+  stand and now says so.
 
 ## The three daemons
 
@@ -72,6 +78,11 @@ task_dispatcher.py     poll tasks/inbox/ → parse spec.json → move to active/
 watcher.py             crash recovery + reconciliation, 15s sweep
 ├─ Popen [python stage_runner_agent.py <task_dir>]    respawn after a runner crash
 │                                                     or a limit-park resume
+├─ clarify.py dead man                                clarify pause unanswered for
+│                                                     CLARIFY_DEADMAN_HOURS → writes the
+│                                                     BA's own defaults into
+│                                                     clarifications.md, requeues ONCE
+│                                                     (off unless the env is set)
 ├─ run [gh pr view …]                                 PR reconciliation: None on ANY
 │                                                     failure = "unknown, retry" — never CLOSED
 └─ run [ps …] + proc_reaper                           liveness / orphan classification
@@ -110,10 +121,11 @@ stage_runner_agent.py <task_dir>          runs the stage sequence for ONE task
 │  │                        from .claude/agents/*.md + --add-dir back to this repo
 │  ├─ memory_inject.py      fills the prompt's <injected-memory> slot for
 │  │                        ba/architect/developer (TEI :8087 embed + Qdrant :6333
-│  │                        search, stdlib HTTP); typed task_lesson write-back at
-│  │                        pipeline completion; degrades to "(none)" — a stage
-│  │                        never blocks on memory infra (replaces the dead
-│  │                        UserPromptSubmit hook path)
+│  │                        search, stdlib HTTP — or memory_flat.py's JSONL store
+│  │                        with MEMORY_FLAT_ENABLED=1, T13); typed task_lesson
+│  │                        write-back at pipeline completion; degrades to
+│  │                        "(none)" — a stage never blocks on memory infra
+│  │                        (replaces the dead UserPromptSubmit hook path)
 │  ├─ proc_reaper.spawn ["claude", --dangerously-skip-permissions,
 │  │                     --session-id <uuid>, --agents <json>, --add-dir …,
 │  │                     --output-format stream-json, -p STAGE_PROMPTS[stage]]
@@ -156,6 +168,7 @@ Two facts here are non-obvious and load-bearing:
 |---|---|
 | `task_dispatcher.py` | file-queue daemon; polls inbox, spawns runners, owns the queue |
 | `watcher.py` | crash recovery + PR reconciliation; respawns runners |
+| `runner_liveness.py` | "is a runner alive for this task" — one definition, shared by `watcher.py` and `aidstack.sh`; matches the process cmdline, not just `kill -0`, because pidfiles outlive their processes and pids get reused |
 | `stage_runner_agent.py` | runs one task's stage sequence via `claude -p` + Agent tool |
 | `stage_prompts.py` | stage data: prompts, artifact names, done-markers (god-module split 2026-06-04) |
 | `agent_roster.py` | persona injection + working-directory resolution for stages |
@@ -163,7 +176,7 @@ Two facts here are non-obvious and load-bearing:
 | `child_env.py` | minimal env for claude children — no operator-shell inheritance (#13) |
 | `pipeline_config.py` | pipeline-owned CLAUDE_CONFIG_DIR + macOS keychain credential seeding |
 | `triage.py` / `triage_wiring.py` | adaptive complexity sizing; drops redundant *upstream* stages only — review/test/security never drop |
-| `clarify.py` | interactive clarification pause on ambiguous specs |
+| `clarify.py` | interactive clarification pause on ambiguous specs; the dead-man half the watcher uses to resume one unanswered pause on the BA's defaults (T10) |
 | `invest_validator.py` | INVEST gate on BA artifacts |
 | `architecture_lint.py` | deterministic structural linter for the Architect artifact (adapted from BMAD) |
 | `control_loop.py` | verdict parsing + iteration primitives |
@@ -173,7 +186,8 @@ Two facts here are non-obvious and load-bearing:
 | `target_policy.py` | target-repo policy, PoC seatbelt, branch-safety gates |
 | `project_registry.py` | the ONE parser for `bot/projects.json` |
 | `budget_gate.py` | cost-cap park → `awaiting-input` with operator notification |
-| `cost_ledger.py` | append-only SQLite ledger of per-stage costs |
+| `cost_ledger.py` | append-only SQLite ledger of per-stage costs (backend + key profile) |
+| `provider_profiles.py` | named key profiles per provider — which key of a backend pays for a stage (T15); no registry ⇒ the global env key |
 | `limit_stall.py` | limit-outage detection on the live stream; parks instead of timing out (#11) |
 | `notify_policy.py` | which events reach Telegram (#19) |
 | `proc_reaper.py` | process-group ownership + orphan reaping (#18) |
@@ -205,20 +219,22 @@ Generated — edit via `ops/check-arch-map.py --update`, never by hand.
 bot/bot.py
 dispatcher/memory_inject.py
 dispatcher/proc_reaper.py
+dispatcher/runner_liveness.py
 dispatcher/task_dispatcher.py
 dispatcher/watcher.py
 
 [imports:dispatcher]
-backend_routing: child_env, pipeline_config, target_policy, triage
+backend_routing: child_env, pipeline_config, provider_profiles, target_policy, triage
 budget_gate: telegram_io
 control_loop: stage_prompts
 git_pr: target_policy
 limit_stall: runner_state, telegram_io
+memory_inject: memory_flat
 post_pipeline: auto_loop, runner_state
-stage_runner_agent: agent_roster, architecture_lint, backend_routing, budget_gate, clarify, control_loop, cost_ledger, git_pr, invest_validator, limit_stall, memory_inject, notify_policy, post_pipeline, proc_reaper, runner_state, stage_prompts, target_policy, telegram_io, triage, triage_wiring
+stage_runner_agent: agent_roster, architecture_lint, backend_routing, budget_gate, clarify, control_loop, cost_ledger, git_pr, invest_validator, limit_stall, memory_inject, notify_policy, post_pipeline, proc_reaper, provider_profiles, runner_state, stage_prompts, target_policy, telegram_io, triage, triage_wiring
 target_policy: project_registry
 triage_wiring: backend_routing
-watcher: budget_gate, limit_stall, proc_reaper, runner_state, telegram_io
+watcher: budget_gate, clarify, limit_stall, proc_reaper, runner_liveness, runner_state, telegram_io
 
 [spawn-sites]
 bot/bot.py :: refresh_code_command :: codegraph
@@ -235,6 +251,7 @@ dispatcher/git_pr.py :: _verify_and_repair_pr_base :: gh
 dispatcher/pipeline_config.py :: _seed_credentials_from_keychain :: security
 dispatcher/proc_reaper.py :: _read_ps :: PS_ARGV
 dispatcher/proc_reaper.py :: spawn :: argv
+dispatcher/runner_liveness.py :: pid_is_alive :: ps
 dispatcher/stage_runner_agent.py :: _git :: git
 dispatcher/stage_runner_agent.py :: _run_claude_stage :: argv
 dispatcher/stage_runner_agent.py :: _run_claude_stage_buffered :: argv
@@ -243,7 +260,6 @@ dispatcher/task_dispatcher.py :: _spawn_stage_runner :: sys.executable+_STAGE_RU
 dispatcher/telegram_io.py :: _send_telegram :: BOTCTL_SEND_TEXT
 dispatcher/triage_wiring.py :: _triage_run_claude :: claude
 dispatcher/watcher.py :: _gh_pr_view :: gh
-dispatcher/watcher.py :: _pid_is_alive :: ps
 dispatcher/watcher.py :: _spawn_runner :: sys.executable+STAGE_RUNNER_SCRIPT
 
 [stage-personas:STAGE_AGENT_MAP]

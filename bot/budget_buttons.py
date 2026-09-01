@@ -30,6 +30,7 @@ FAILED_DIR = _TASKS_ROOT / "failed"
 
 _REASON_RU = {
     "cost_cap": "достигнут лимит стоимости",
+    "token_cap": "достигнут лимит токенов",
     "iteration_cap": "достигнут лимит итераций",
     "stagnant": "правки перестали сходиться",
     "watchdog_idle": "стадия зависла (idle)",

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Weekly leak-watch sweep on macOS/atlas. Copy to
+     ~/Library/LaunchAgents/com.<you>.ai-delivery-leak-watch.plist, replace
+     <REPO_ROOT> and the python path, then:
+       launchctl load  ~/Library/LaunchAgents/com.<you>.ai-delivery-leak-watch.plist
+       launchctl start com.<you>.ai-delivery-leak-watch    # run once now
+     leak-watch alerts to Telegram (--telegram) only on NEW hits; a quiet
+     week produces no message. Output/errors land in logs/leak-watch.log. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.ai-delivery-leak-watch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string><REPO_ROOT>/bot/venv/bin/python</string>
+    <string><REPO_ROOT>/ops/leak-watch.py</string>
+    <string>--telegram</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>1</integer>
+    <key>Hour</key><integer>9</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key>
+  <string><REPO_ROOT>/logs/leak-watch.log</string>
+  <key>StandardErrorPath</key>
+  <string><REPO_ROOT>/logs/leak-watch.log</string>
+</dict>
+</plist>

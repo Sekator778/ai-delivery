@@ -239,7 +239,7 @@ printf "  uv               : %s\n" "$(need uv && uv --version || echo MISSING)"
 printf "  ffmpeg           : %s\n" "$(need ffmpeg && ffmpeg -version 2>/dev/null | head -1 | cut -d' ' -f1-3 || echo MISSING)"
 printf "  jq               : %s\n" "$(need jq && jq --version || echo MISSING)"
 printf "  symlinks         : "
-ls -la "$RUNTIME_DIR" 2>/dev/null | grep -c '^l' || echo 0
+find "$RUNTIME_DIR" -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' '
 echo ""
 echo "Next steps if any 'warn' appeared:"
 echo "  - edit $env_path to add missing keys"

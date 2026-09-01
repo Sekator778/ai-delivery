@@ -23,8 +23,8 @@
 # Exit codes:
 #   0  success (published / dry run / nothing to publish / self-check ok)
 #   1  usage error
-#   2  preflight failure (bad ref, missing gitleaks, missing blocklist,
-#      no reachable tag, unauthorized --push)
+#   2  preflight failure (bad ref, stale/diverged ref, missing gitleaks,
+#      missing blocklist, no reachable tag, unauthorized --push)
 #   3  gate finding (secrets or PII detected in export or commit message)
 #   4  push/verification failure
 #
@@ -33,6 +33,8 @@
 #
 # Options:
 #   --ref <ref>            Git ref to publish (default: dev)
+#   --allow-stale-ref      Publish even if <ref> is not in sync with origin
+#                          (announced in the output; never silent)
 #   --summary <text>       Commit message summary (overrides CHANGELOG fallback)
 #   --push                 Authorize a real push (requires --push-url or
 #                          --allow-temp-pushurl)
@@ -88,6 +90,12 @@ readonly EXCLUDE_DIRS=(STATE research briefs memory-bank backlog)
 # Widening it publishes a directory: review it like a secret constant.
 readonly PUBLIC_TOPLEVEL=(
   .claude
+  # Added 2026-08-31. The only file under it is the CI workflow, which carries
+  # no secrets (verified) and no operator-specific data beyond the machine
+  # nickname "atlas" — already public via the whole of ops/atlas/. Publishing
+  # it means the mirror shows how this project is actually tested, which is
+  # most of what a reader wants from a workflow file.
+  .github
   .env.example
   .gitattributes
   .gitignore
@@ -135,6 +143,12 @@ readonly EXCLUDE_FILES=(bot/projects.json CLAUDE.md)
 readonly TASKS_KEEP_PATTERN="tasks/_TEMPLATE"
 readonly BLOCKLIST_FILE="$REPO_ROOT/ops/publish-blocklist.local"
 
+# The remote the SOURCE ref is checked against for freshness (T23).
+# Deliberately NOT env-overridable, unlike PUBLISH_REMOTE: pointing this at a
+# remote that does not exist would silently turn the freshness check off, which
+# is the one outcome --allow-stale-ref exists to make loud and deliberate.
+readonly SOURCE_REMOTE="origin"
+
 # ---------------------------------------------------------------------------
 # Logging helpers.
 # ---------------------------------------------------------------------------
@@ -142,7 +156,11 @@ step() { printf '[publish] >>> %s\n' "$*"; }
 ok()   { printf '[publish] OK  %s\n' "$*"; }
 skip() { printf '[publish] --  %s\n' "$*"; }
 warn() { printf '[publish] WARN %s\n' "$*" >&2; }
-die()  { printf '[publish] FATAL: %s\n' "$*" >&2; exit "${2:-1}"; }
+# "$1", not "$*": the second argument is the exit code, and "$*" printed it as
+# part of the message — every one of the 19 `die "..." N` calls ended with a
+# stray " N". Harmless until a message spans several lines, where the digit
+# lands under the remediation hint and reads like part of it.
+die()  { printf '[publish] FATAL: %s\n' "$1" >&2; exit "${2:-1}"; }
 
 # ---------------------------------------------------------------------------
 # Temp root + cleanup trap (ADR-009).
@@ -170,6 +188,7 @@ SUMMARY=""
 DO_PUSH=0
 PUSH_URL=""
 ALLOW_TEMP_PUSHURL=0
+ALLOW_STALE_REF=0
 SELF_CHECK=0
 
 parse_args() {
@@ -186,6 +205,7 @@ parse_args() {
         [[ $# -ge 2 ]] || die "--push-url requires a value" 1
         PUSH_URL="$2"; shift 2 ;;
       --allow-temp-pushurl) ALLOW_TEMP_PUSHURL=1; shift ;;
+      --allow-stale-ref)   ALLOW_STALE_REF=1; shift ;;
       --dry-run)           DO_PUSH=0; shift ;;
       --keep-tmp)          KEEP_TMP=1; shift ;;
       --self-check)        SELF_CHECK=1; shift ;;
@@ -251,6 +271,111 @@ self_check() {
 }
 
 # ---------------------------------------------------------------------------
+# check_ref_freshness — refuse to publish a source tree that is not what
+# origin says the branch is (T23).
+#
+# The script already refuses to trust local state for the DESTINATION:
+# fetch_public() pulls a fresh mirror tip before building the export, and the
+# push is verified by re-fetching. That discipline was simply never applied to
+# the SOURCE. It cost us public commit 19238a3 (2026-08-21), which shipped a
+# stale tree under a summary describing changes that were not in it — the
+# summary looked precise because it prints a SHA, just the wrong one.
+#
+# Refusal, not a warning. `aidup` deliberately chose the opposite default for
+# the same class of check, and it is right there: a stand running yesterday's
+# code beats a stand that will not start, and a human is reading the output.
+# Publishing inverts both premises — it writes irreversibly to a live public
+# repository, and nobody eyeballs the result. The cost of refusing is one
+# `git fetch`; the cost of staying quiet is already measured.
+# ---------------------------------------------------------------------------
+check_ref_freshness() {
+  if [[ "$ALLOW_STALE_REF" -eq 1 ]]; then
+    # Loud on purpose: an operator who passes this flag should see it take
+    # effect, and a reader of the log should never have to guess whether the
+    # check ran.
+    warn "freshness: check skipped by --allow-stale-ref — ref '$REF' may be stale"
+    return 0
+  fi
+
+  # No source remote at all is not drift: there is nothing the ref claims to
+  # track, so it cannot have fallen behind it. This is the case for every test
+  # fixture and for --self-check, and for a clone that genuinely has no origin.
+  # Announced rather than skipped in silence — "the check did not apply" and
+  # "the check passed" must not look the same in the output.
+  if ! git remote get-url "$SOURCE_REMOTE" >/dev/null 2>&1; then
+    skip "freshness: no '$SOURCE_REMOTE' remote — ref '$REF' has nothing to be stale against"
+    return 0
+  fi
+
+  local local_sha remote_sha ls_status
+  local_sha="$(git rev-parse "${REF}^{commit}")"
+
+  # ls-remote separates the two failures a plain fetch would blur together:
+  # exit 2 means the branch is not on the remote, anything else non-zero means
+  # we could not ask.
+  set +e
+  remote_sha="$(git ls-remote --exit-code --heads "$SOURCE_REMOTE" "$REF" 2>/dev/null | awk 'NR==1{print $1}')"
+  ls_status=$?
+  set -e
+
+  if [[ "$ls_status" -eq 2 ]]; then
+    skip "freshness: '$REF' does not exist on $SOURCE_REMOTE — nothing to compare against"
+    return 0
+  fi
+  if [[ "$ls_status" -ne 0 || -z "$remote_sha" ]]; then
+    # Unknown is not the same as fine. A skipped network check that prints
+    # nothing would leave the log looking exactly like a successful one.
+    die "Cannot reach '$SOURCE_REMOTE' to verify that ref '$REF' is current.
+  Freshness is unknown, not confirmed — refusing to publish.
+  Retry with a working network, or pass --allow-stale-ref to publish anyway." 2
+  fi
+
+  if [[ "$local_sha" == "$remote_sha" ]]; then
+    ok "freshness: $REF == $SOURCE_REMOTE/$REF (${local_sha:0:12})"
+    return 0
+  fi
+
+  # The tips differ, so the remote commit object is needed to tell behind from
+  # ahead from diverged. Fetch it only now — the equal-tips case, which is the
+  # common one, costs a single ls-remote.
+  if ! git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+    if ! git fetch --quiet "$SOURCE_REMOTE" "$REF" 2>/dev/null; then
+      die "Ref '$REF' differs from $SOURCE_REMOTE/$REF, and fetching it failed.
+  Cannot classify the difference — refusing to publish.
+  local=${local_sha:0:12} remote=${remote_sha:0:12}" 2
+    fi
+  fi
+
+  local behind ahead
+  behind="$(git rev-list --count "${local_sha}..${remote_sha}" 2>/dev/null || echo '?')"
+  ahead="$(git rev-list --count "${remote_sha}..${local_sha}" 2>/dev/null || echo '?')"
+
+  if git merge-base --is-ancestor "$local_sha" "$remote_sha" 2>/dev/null; then
+    die "Ref '$REF' is ${behind} commit(s) BEHIND $SOURCE_REMOTE/$REF.
+  Publishing it would ship a stale tree under a summary describing work that
+  is not in it — this is exactly how public commit 19238a3 happened.
+  Fix:      git fetch $SOURCE_REMOTE && git checkout $REF && git merge --ff-only $SOURCE_REMOTE/$REF
+  Override: --allow-stale-ref
+  local=${local_sha:0:12} remote=${remote_sha:0:12}" 2
+  fi
+
+  if git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+    die "Ref '$REF' is ${ahead} commit(s) AHEAD of $SOURCE_REMOTE/$REF.
+  Those commits are not on $SOURCE_REMOTE, so publishing them would put code in
+  a live public repository that the private repository does not have.
+  Fix:      git push $SOURCE_REMOTE $REF
+  Override: --allow-stale-ref
+  local=${local_sha:0:12} remote=${remote_sha:0:12}" 2
+  fi
+
+  die "Ref '$REF' has DIVERGED from $SOURCE_REMOTE/$REF (${ahead} ahead, ${behind} behind).
+  Neither tree is a superset of the other, so no publish from here is the whole
+  branch. Reconcile the histories first.
+  Override: --allow-stale-ref
+  local=${local_sha:0:12} remote=${remote_sha:0:12}" 2
+}
+
+# ---------------------------------------------------------------------------
 # preflight — all fail-closed checks before any temp state (exit 2).
 # ---------------------------------------------------------------------------
 VERSION=""
@@ -297,6 +422,11 @@ preflight() {
       die "--push-url and --allow-temp-pushurl are mutually exclusive." 2
     fi
   fi
+
+  # Freshness last: every check above is local and instant, so a missing
+  # gitleaks or blocklist is reported without first waiting on a network round
+  # trip. Still inside preflight, so it gates the export and both scans.
+  check_ref_freshness
 
   ok "preflight: ref=$REF version=$VERSION gitleaks=$gl_ver blocklist=present"
 }
@@ -439,7 +569,10 @@ build_export() {
       # tasks/README.md
       [[ "$path" == "tasks/README.md" ]] && keep=1
       # tasks/_TEMPLATE/** (anything under _TEMPLATE)
-      [[ "$path" == tasks/_TEMPLATE/* || "$path" == "tasks/_TEMPLATE" ]] && keep=1
+      # Uses TASKS_KEEP_PATTERN rather than repeating the literal: the constant
+      # was declared and then never read, so editing it changed nothing while
+      # looking like it changed the filter (found by shellcheck, SC2034).
+      [[ "$path" == "$TASKS_KEEP_PATTERN"/* || "$path" == "$TASKS_KEEP_PATTERN" ]] && keep=1
       # tasks/*/.gitkeep (each column's marker)
       [[ "$path" == tasks/*/.gitkeep ]] && keep=1
       if [[ "$keep" -eq 0 ]]; then

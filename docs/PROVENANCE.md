@@ -55,6 +55,7 @@ template's `UPSTREAM` file record the exact file-level mappings.
 | Auto-loop iteration semantics + idle watchdog | `auto_loop.py` (claude-tg-orchestrator `4aa02b0`, watchdog `fb4cdc8`) | **adopted** |
 | Daemon lifecycle style: pidfiles, one-generation log rotation, detached start | `ops/atlas/aidstack.sh` (from an earlier private stack script of the operator's) | **adopted** |
 | Folder-as-state-machine task queue (`inbox/ → active/ → … → done/`) | `task_dispatcher.py`, `tasks/` | **ours** (Phase 5 design) |
+| Semantic recall over a vector DB (mem0-era `meta_agent_mem` in Qdrant + TEI bge-m3) | `memory_inject.py`, `scripts/qdrant-memory.py` | **ours**; 2026-08-21 verdict (backlog/T13): not justified at this scale — 600 MB and two always-on services for 3.2 MB of vectors, 787 of 809 points frozen prose from hooks retired in `a364eb6`. Flat store recommended, Qdrant dropped, semantics kept; awaiting owner GO — see ROADMAP "Phase Memory-Footprint" |
 
 ## Incident-born (ours)
 

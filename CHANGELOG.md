@@ -1,15 +1,471 @@
 # Changelog
 
 All notable changes to ai-delivery are listed here. Dates are when the
-milestone landed on the development branch (private upstream); the public
-mirror is released on the date noted under `[Unreleased]` → next tag.
+milestone landed on the development branch (private upstream). The public
+mirror still exists but is no longer refreshed — publication is paused since
+2026-08-21 and development happens privately — so a "release" is a tag on
+`dev` until the owner resumes publishing.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project does not yet follow strict SemVer (pre-1.0).
 
 ## [Unreleased]
 
-Forwarded granularly to the public mirror per the v0.8 history policy.
+Entries accumulate here until the next tag.
+
+## [1.2.0] — 2026-09-01
+
+The milestone: DeepSeek carries every mechanical stage, the stand deploys
+itself safely (`restart --wait`), the functions runtime got its governance,
+and the next iteration — the "specialists room" (a single entry point for
+any task, not only code) — is designed, researched against working
+reference implementations, and cut into briefs (backlog/T25, T26).
+
+- **DeepSeek now carries all eight mechanical stages** (owner directive,
+  2026-08-31). `DEEPSEEK_STAGES` gained `pattern-detector`, `tasks`,
+  `analyze`, `edge-cases` on top of the build/verify four. Grounds: the
+  live ledger showed ~92% of a task's cost sitting in anthropic stages;
+  first live task after the change ran pattern-detector for $0.09.
+  ba/architect stay on Opus, reviewer on Sonnet; the L-tier guard,
+  per-task `model_routing` and the iteration-2 escalation still win.
+- **`/task @alias` followed by a newline resolves again** — the alias
+  parser split the body on the first space only, so a task text starting
+  on the next line swallowed the newline into the alias token and failed
+  as "unknown alias" while listing that very alias as known.
+- **Functions runtime got governance and packaging** (backlog/T21, T22 —
+  work landed in the sandbox repo). Promote now enforces a per-function
+  contract check, the active set is bounded, retirement exists, and
+  SKILL.md packaging is generated from source annotations with a sync
+  test — the roadmap #1/#3 pair that was blocked on the owner's
+  functions-runtime verdict (GO 2026-08-31).
+- **The specialists-room iteration is designed and grounded.** Design
+  note (`STATE/DESIGN-2026-08-31-front-door.md`): one entry point for any
+  task, a conductor that synthesizes specialists on demand (no salaried
+  roster), approve-gate generalizing the merge gate. Two reference
+  implementations studied at code level (`research/*-code-study-2026-09.md`):
+  AOrchestra (the conductor pattern, ~600 lines of core) and ReasoningBank
+  (strategy memory distilled from successes AND failures). Briefs cut:
+  T25 (conductor MVP), T26 (strategy memory over the flat store).
+
+- **CI: shellcheck is a blocking gate, and gitleaks now scans the whole
+  history.** Both were deliberate omissions waiting on a triage that has now
+  been done. shellcheck runs at `severity=warning` over every tracked script
+  except vendor material in `research/external/`; `info`/`style` stay
+  non-blocking because SC1091/SC2015/SC2317 dominate them here and a gate
+  nobody can keep green is one everyone ignores. The six historical gitleaks
+  findings turned out to be two things — a DeepSeek key rotated 2026-05-27, and
+  a 40-hex git commit SHA in a URL misread as a Sourcegraph token, matched five
+  times — both pinned by fingerprint in a new `.gitleaksignore` with the
+  reasoning inline. History was not rewritten: a dead key and a commit hash do
+  not justify force-pushing 593 commits. The value is that the next finding in
+  history will be a new one.
+- **Two latent bugs found by that shellcheck triage.** In `aidstack.sh`,
+  `local name="$1" pidfile="$PID_DIR/$name.pid"` evaluated `$name` before the
+  assignment landed, so it read the *caller's* variable — correct only because
+  both call sites happen to loop over one named `name`. In
+  `publish-public.sh`, `TASKS_KEEP_PATTERN` was declared and never read while
+  the filter beside it repeated the literal, so editing the constant looked
+  like editing the filter and changed nothing.
+- **`.github/` is now published to the mirror** (`PUBLIC_TOPLEVEL`). Its only
+  file is the CI workflow: no secrets, and no operator data beyond the machine
+  nickname already public through `ops/atlas/`. Pinned by a test, mirroring the
+  one that asserts an unlisted directory never ships.
+
+- **`aidstack.sh restart` — the command that actually deploys** (backlog/T24).
+  `up` is idempotent and never touches a live daemon, so on a running stand it
+  pulled new code onto disk and left the daemons executing the modules they
+  imported at start — while every stage, a fresh process, read the new code, as
+  did the persona and prompt files. Orchestrator and stages on different
+  versions, and `up` reported success. `restart` stops, pulls and starts, so
+  the running processes execute what was pulled; `up` now warns when it moved
+  the checkout under live daemons.
+- **`restart` and `down` refuse while a task runner is alive.** Both kill work
+  in flight — `down` also sweeps orphaned `claude` children — and a stage killed
+  halfway is a paid Claude call thrown away. `--wait` waits for the current task
+  (`AIDSTACK_WAIT_TIMEOUT`, default 3600s) and refuses on timeout rather than
+  falling through to a kill; `--force` overrides and says so. Liveness comes
+  from the new `dispatcher/runner_liveness.py`, extracted from `watcher.py` so
+  both sides share one definition: the check matches the process command line
+  against the runner script and task id, because a pidfile outlives its process
+  and pids get reused.
+
+- **Publishing refuses a source ref that is not in sync with `origin`**
+  (backlog/T23). `publish-public.sh` exported from the local ref with no
+  freshness check, which is how public commit `19238a3` shipped a stale tree
+  under a summary describing changes that were not in it — the summary looked
+  precise because it prints a SHA, just the wrong one. Preflight now compares
+  `--ref` against `origin` and aborts (`exit 2`) when it is behind, ahead or
+  diverged, and also when `origin` cannot be reached: unknown freshness is not
+  confirmed freshness. No `origin`, or a ref absent from it, proceeds — there
+  is nothing to be stale against — but says so, because "the check did not
+  apply" must not look like "the check passed". `--allow-stale-ref` overrides
+  and announces itself; the remote compared against is a `readonly` constant,
+  so there is no silent way off. The script already re-fetched the mirror tip
+  before building and verified the tip after pushing; this applies the same
+  distrust of local state to the source.
+- **`die()` no longer prints its exit code as part of the message.** It
+  interpolated `"$*"`, so all 19 `die "..." N` call sites emitted a stray
+  ` N` at the end of the text. Invisible on one-line messages; on a multi-line
+  one the digit lands under the remediation hint and reads like part of it.
+
+- **Triage: `permission` needs an auth neighbour** (backlog/T19). Fifth word of
+  the same class, after `secret`, `session`, the payment words and `token`.
+  This repo lives inside Claude Code, where permission is harness vocabulary,
+  not authentication — and `auth` is a HARD flag, so one match forces tier=L on
+  its own: every stage on Anthropic, L-sized caps. Measured before the change:
+  **seven false positives out of eight**, including `permissions: contents:
+  read`, a line from this project's own CI workflow.
+
+  `rbac` and `acl` still match bare. `check`/`checks` is deliberately *not* an
+  accepted neighbour — "permission check" is as much harness vocabulary as auth
+  vocabulary here, and under-matching a rare phrase beats keeping the false
+  positive. `privilege escalation` is **added**, not preserved: it did not
+  match at all before, there being no `privilege` in the alternation — the
+  brief assumed otherwise.
+
+  The four earlier narrowings were pinned by nothing but comments in the
+  regex, so re-widening any of them would have gone unnoticed.
+  `RiskWordNarrowingTests` now pins all five, in both directions.
+
+- **Memory store: the tmp residue is gone** (backlog/T20). 21 `task_lesson`
+  points scoped to `$TMPDIR` fixtures — written by runner-level tests before
+  the T02 guard existed — diluted every recall, because the scoped half of
+  `recall()` filters by `target_repo` and these are targets that no longer
+  exist. Payload export 810 → 789 via a new
+  `qdrant-memory.py purge-ephemeral`, dry-run by default.
+
+  **21, not the ~27 the brief estimated.** The brief asked for the list to be
+  read before writing, and reading it is what produced the difference: six
+  further points carry a temp path in their *text* but are `session_stop` /
+  `subagent_stop` summaries — real operator hand-offs quoting a path in
+  passing. Selection is by `target_repo` only.
+
+  Found on the way: `_is_ephemeral_target` was **host-dependent**. Built on
+  `tempfile.gettempdir()`, it answers "is this ephemeral *here*", while the
+  store is portable — the JSONL travels in git and is read from Linux, but the
+  points were written on macOS, whose `$TMPDIR` is `/var/folders/<xx>/<yyy>/T/`.
+  The same record was garbage on one machine and legitimate on another, so a
+  purge run from the wrong host silently found nothing. The predicate now
+  recognises that shape regardless of host, which also makes the production
+  write-back guard strictly more correct.
+
+  The live flat store is gitignored and lives on the host; the purge has to be
+  run there too, or recall keeps serving them.
+
+## [1.1.0] — 2026-08-28
+
+- **Semantic recall can now run without Qdrant** (`MEMORY_FLAT_ENABLED`, off
+  by default). The collection held 3.16 MB of vectors in 600 MB on disk, served
+  by two always-on services, and 787 of its 809 points are frozen prose from
+  hooks retired in August. `dispatcher/memory_flat.py` does the same ranking
+  over a JSONL file: normalise once on load, cosine scan, the scoped half of
+  recall becomes a field comparison instead of a payload filter. A stdlib scan
+  of the whole collection takes about 70 ms — against three recalls per task
+  and stages measured in minutes, that is noise. (The ROADMAP previously said
+  "microseconds", which was wrong.)
+- **Starting the stand is the deploy.** `aidup` now takes the newest commit of
+  the branch the checkout is on, then starts; nothing new, or anything in the
+  way, and it starts what is already there. No scheduler, no agent, no
+  background process.
+
+  The update never blocks the start: a dirty tree, unpushed local commits,
+  diverged history, a detached HEAD or no network are each a warning, not a
+  failure. A stand that refuses to come up because git had an opinion is worse
+  than one running last week's code — and unlike an unattended loop, a human is
+  reading the output. Every path returns 0, and six of the nine tests assert
+  exactly that.
+
+  It follows whatever branch is checked out, so no branch name lives in two
+  places. `AIDUP_PULL=0 aidup` skips it; `aidstack.sh pull` runs just the
+  update.
+
+  This replaces the polling agent added earlier the same day and removed before
+  it ever ran unattended. That version worked — 7 ms per idle cycle, no
+  resident process — but it needed an in-flight marker, a failure counter with
+  an attempt limit, a live-runner deferral and a stack-is-up precondition, all
+  of which existed only because no human was present. With a human running the
+  command, ~300 lines and 15 tests collapse to ~45 lines and 9.
+
+
+- **`master` is the branch things start from, not an archive of releases.**
+  Owner's call. Development still happens on `dev` and every PR is still based
+  there; what changed is `master`'s job. It is the repository's GitHub default,
+  so it is what a fresh clone gets, what a new harness session is cut from, and
+  what anything triggered against this repo runs.
+
+  Which gives the rule the rest follows from: `master` must not go stale. A
+  trigger branch that lags behind `dev` runs old code and reports on it
+  confidently. `dev` is merged into `master` as soon as work has landed and CI
+  is green — not only at a version tag. Fast-forward when it can be, an
+  ordinary merge when it cannot; "it would not fast-forward" is a reason to
+  find out what landed out of band, not a reason to leave `master` behind.
+
+  The earlier recommendation to switch the GitHub default to `dev` is dropped:
+  the default stays `master` precisely because that is what triggers run from.
+  The cost is accepted — GitHub preselects `master` as a new PR's base and it
+  has to be retargeted by hand.
+
+  Tagging a version is now a separate, smaller section rather than the only
+  path to `master`. `ops/RELEASE.md` splits accordingly, and its post-check
+  becomes `git rev-list --count master..dev` = 0, which catches staleness and
+  not just a stranded tag. `CONTRIBUTING.md` "Branch model" and `CLAUDE.md` §1
+  are rewritten to match.
+
+- **Triage stops reading "token" as authentication.** `auth` is a hard risk
+  flag: one match forces tier L whatever size and clarity say. It carried a bare
+  `token` — and in this project a token is the unit of the budget, not a
+  credential. `token_cap`, "token budget", "input/output tokens", "500k tokens",
+  the tokenizer; one whole brief is about the token cap. The line "tokens, not
+  dollars, are the budget unit on a subscription", from our own test docstring,
+  came back as `risk=auth`.
+
+  `token` now needs an auth-side neighbour — a qualifier in front (access,
+  refresh, bearer, auth, session, id, csrf, api, reset, bot, personal access, …)
+  or an auth action behind it (revocation, rotate, expiry, validation, leak,
+  scope, introspection, …). The unambiguous words still match bare, so "JWT",
+  "OAuth", "credential", "password" and "login" carry most real auth text
+  anyway. Checked both directions: ten lines of this project's budget vocabulary
+  no longer flag, twelve lines of real credential work still do.
+
+  Fourth instance of one shape, after `secret`, `session` and the payment words:
+  a term that means risk in the domain and ordinary work in this repository's
+  own vocabulary. Policy is untouched — hard-risk dominance, the L guard and the
+  iteration-2 escalation were all bought with incidents.
+
+- **Retiring Qdrant, the rest of the way.** The flat store landed with the
+  runner switched over and everything around it still Qdrant-shaped. Now:
+  `ops/atlas/aidstack.sh` reads `MEMORY_FLAT_ENABLED` from `bot/.env` and, when
+  it is on, neither starts the container nor waits on `:6333` — the next
+  `aidup` no longer resurrects it — while `aidstatus` reports the store's point
+  count, size and age, and says MISSING or EMPTY when it should. With the flag
+  off the script behaves exactly as before, because the rollback has to stay
+  real.
+
+  The bot's `/memo` and `/recall` went through `MEMO_QDRANT_URL` directly and
+  answered `❌ Qdrant: …` with the container stopped. They now call
+  `memory_inject.remember()` / `search_text()`, so they follow the flag like
+  every other reader. That also removes a bug nobody had noticed: the bot
+  embedded with FastEmbed `multilingual-e5-large` while the runner embeds with
+  TEI `bge-m3` — two models writing vectors into one collection, where
+  cosine distance between them means nothing.
+
+  And `dump --with-vectors`, the documented migration path, did not work: it
+  scrolled the vectors and then dropped them on the floor, writing the
+  payload-only filename. It writes `meta_agent_mem.vectors.jsonl` now, in the
+  shape `memory_flat.load()` reads, with vectorless points reported rather than
+  silently emitted. The live store on the host was produced by a one-off script
+  during the migration; this is the reproducible path, pinned by a test that
+  dumps and then loads the result.
+
+  Git policy for the store is now written down (ADR `flat-store-git-policy`):
+  the payload dump is committed, the vectors file is gitignored — and the
+  consequence, that the live store is not backed up by git, is stated where an
+  operator will read it instead of discovered after a disk dies.
+
+- **Stage children can be confined to a network allowlist**
+  (`EGRESS_SCOPING_ENABLED`, off by default). A stage runs
+  `claude --dangerously-skip-permissions` over a repository whose *content* is
+  the attack surface, and its Bash tool could reach any host on the internet.
+  The env allowlist closed "leak the key"; it never closed "leak through a
+  request".
+
+  The CLI already ships the mechanism — a domain allowlist enforced by a local
+  proxy with a kernel backstop that drops non-loopback traffic at the socket
+  layer — so this configures it rather than reimplementing it, in the
+  `settings.json` the pipeline already rewrites on every run. Four of the
+  settings are load-bearing and are commented as such where they live: the
+  sandbox fails closed instead of warning and running unsandboxed; the agent
+  cannot lift it through `dangerouslyDisableSandbox`; filesystem isolation is
+  deliberately off because a stage must write its worktree; and the target
+  repo's own settings cannot widen the allowlist.
+
+  The allowlist covers the model endpoints, GitHub, and the package registries
+  a stage needs to build its target — that last group is the honest weak spot,
+  since a publish to a registry is a channel it cannot close. It still narrows
+  "the whole internet" to "vendors plus registries". Extend per host with
+  `EGRESS_EXTRA_DOMAINS`.
+
+- **A provider can have more than one key now** (`bot/providers.json`, absent by
+  default). Until now `_subagent_env` read a single `DEEPSEEK_API_KEY` /
+  `GLM_API_KEY` from the environment, so a personal key and a work key could not
+  coexist, and the ledger recorded which *backend* paid but never which *key* —
+  spend could not be split per quota.
+
+  A registry names profiles; each points at an environment variable or a file,
+  never at a literal key, because a JSON full of keys is just a second `.env`
+  without the protection the first one has. Selection is per task (a
+  `model_routing` value may carry `"deepseek:alt"`) or per session (`/backend
+  deepseek:alt` in Telegram, stored durably and stamped into new specs as
+  `provider_profile`), falling back to `defaults.<backend>`. **Without a
+  registry every path behaves exactly as before** — that regression is pinned by
+  a test rather than asserted.
+
+  The profile name is attribution, and it travels: `state.json`, a new
+  `profile` column in the cost ledger (added by an idempotent migration, so a
+  database written before this keeps working), and a "By key profile" slice in
+  `ops/cost-report.py`. The key value does not travel: the parent resolves it
+  and writes only `ANTHROPIC_AUTH_TOKEN` into the child, the profile's own
+  variable is never added to the child-env allowlist, and a stage running on a
+  profile no longer sees the provider's default key at all — which is slightly
+  *stricter* than before.
+
+  A profile whose variable resolves to nothing degrades exactly like a missing
+  global key: warn, fall back to anthropic. A profile is dropped when the stage
+  escalates to another backend — a deepseek profile means nothing to anthropic.
+
+- **The branch model is written down, and a release has a checklist.** The
+  model in the owner's head — `dev` is current, `master` is released versions,
+  work branches die with their PR — was not in any document, and the repository
+  had drifted from it: `master` sat 133 commits behind `dev`, and the `v1.0.1`
+  and `v1.0.2` tags were cut on `dev` and never reached `master`, so "master =
+  releases" had quietly stopped being true two releases ago.
+
+  `CONTRIBUTING.md` now carries a "Branch model" section (branch roles, PRs
+  based on `dev`, delete-after-merge with the `merge-base --is-ancestor` proof
+  before deleting anything by hand, merge commits into `dev` and fast-forward
+  only into `master`, hotfixes from `master` only when a release is broken), and
+  `ops/RELEASE.md` is the one-page release checklist. `CLAUDE.md` §1 points at
+  both in one line instead of repeating them. The post-release check in that
+  checklist is `git merge-base --is-ancestor vX.Y.Z master` — the assertion that
+  would have caught the drift the first time it happened.
+
+  CI now also runs on pushes to `master`: a release fast-forward should not be
+  the one merge nobody checked.
+
+- **Triage stops reading this project's own vocabulary as payment risk.** The
+  `payment` pattern is a HARD risk flag — one match forces tier L whatever the
+  size and clarity say — and it carried bare `checkout`, `subscription`, `ledger`
+  and `charge`. Those are ordinary words here: `git checkout -b`, the Anthropic
+  subscription window, the cost ledger the pipeline writes per stage, "the CLI
+  charges every session at Anthropic rates". Any task mentioning one of them
+  risked the full pipeline on the expensive backend, which is how a single
+  "session" killed a task on its cost cap in August.
+
+  Each of the four now needs a payment-side qualifier (`checkout page/flow/cart`,
+  `subscription billing/fee/renewal`, `general ledger`, `ledger entry`, `charge
+  the card`, `chargeback`). The unambiguous terms — payment, billing, invoice,
+  stripe, paypal, braintree, refund, payout — still match on their own, and real
+  phrasing like "Stripe checkout flow" or "subscription billing" keeps matching
+  through them anyway. Same narrowing, same reason as `secret` in June and
+  `session` before this. Policy is untouched: hard-risk dominance, the L-guard
+  and the iteration-2 escalation are incident-bought and stay.
+
+  Checked by hand both ways — ten strings from this project's own vocabulary no
+  longer flag, ten real payment strings still do.
+
+- **A clarification pause can now time out into the BA's own defaults**
+  (`CLARIFY_DEADMAN_HOURS`, off by default). When the BA leaves
+  `[NEEDS CLARIFICATION]` markers, the task parks in `awaiting-input/` and waits
+  for a Telegram reply — with no timeout at all. On 2026-08-17 two live tasks
+  stood in that pause for about three hours because the questions went unnoticed,
+  and the answers they eventually got were the defaults the BA had itself
+  proposed: the spec-kit contract requires every marker to carry one.
+
+  With the dial set, the watcher resumes such a task by writing those defaults
+  into the same `clarifications.md` an operator's reply would have produced —
+  the answer text points the BA back at the default it recorded and asks it to
+  state the choice explicitly, rather than inventing an answer here. The worklog
+  and Telegram both say the resume was automatic and unconfirmed.
+
+  Bounded on purpose. Exactly one automatic resume per task, counted in state and
+  carried across re-ingest, so a second clarify pause — the BA asking again after
+  seeing the defaults — waits for a human. The age is measured from an explicit
+  pause stamp, never from the state file's mtime, which re-ingest rewrites. A
+  task parked with no readable stamp and no recoverable questions is left alone.
+  At the default of 0 hours the sweep returns before touching anything.
+
+  A reply that arrives after an automatic resume was already rejected (the task
+  is no longer in `awaiting-input/`), but the rejection called the task "closed"
+  when it was in fact running; it now says the task continued on defaults and
+  points at `/requeue`.
+
+- **Triage no longer reads every "session" as an auth risk.** The risk scanner's
+  `auth` alternation carried a bare `session`, and a hard risk flag *dominates*:
+  it forces tier L regardless of how small or clear the change is. On the task
+  behind issue #20 — killing orphaned `claude` child processes — the single
+  qualifying word in the whole prompt was "own session per child", in the sense
+  of a process session. That one word bought the task the full pipeline with
+  every stage on the expensive backend, and it stopped on its cost cap.
+
+  `session` now has to be qualified to count: `session cookie`, `session
+  fixation`, `session hijacking`, `session replay`. `session token` and `session
+  credential` still match through the neighbor words they carry, and every other
+  auth term (`login`, `oauth`, `sso`, `jwt`, `rbac`, …) is untouched. This is the
+  same narrowing, for the same reason, as dropping the bare `secret` from the
+  crypto pattern in June.
+
+  Checked by hand both ways: seven harmless uses of session (process sessions,
+  tmux, a rate-limit window, a stored session id) no longer flag, and eight real
+  auth strings still do. What is deliberately NOT changed is the policy around
+  the scanner — hard-risk dominance, the L-guard and the iteration-2 escalation
+  are incident-bought and stay exactly as they are. This is scanner precision,
+  not a relaxed guard.
+
+- **`ops/cost-report.py` — the ledger finally has a reader.** Every finished
+  stage has been appending an honest cost row to the SQLite ledger for a while,
+  and `dispatcher/cost_ledger.py` says out loud that callers query it "via
+  sqlite3 CLI or a future /cost-report command". There was no such command, so
+  the questions the data exists to settle — which stage is the money, what a
+  task actually cost, what DeepSeek's off-peak half-rate would mean — were
+  answered by impression.
+
+  Three slices over a `--since`/`--until` window (7 days by default): per stage,
+  with each stage's share of the *average task* alongside its share of the
+  window, because those differ whenever tasks differ in size and it is the
+  per-task share that answers "is the reviewer 40% of a task?"; per task, with
+  its triage tier when the task directory is still around; and the recomputed
+  (`computed:<model>`) rows split into peak and off-peak, since the price
+  override deliberately holds peak rates as an upper bound and the off-peak
+  bucket is therefore a known overstatement.
+
+  Markdown tables on stdout (meant to be pasted into a note), `--csv DIR` for
+  spreadsheets, `--task <id>` for one task stage by stage. stdlib only. The
+  database is opened `file:...?mode=ro`, so sqlite — not a code review —
+  guarantees the tool never writes to the ledger.
+
+- **A budget cap between stages now parks the task instead of failing it.** The
+  operator gate that turns a cap stop into `awaiting-input/` plus a
+  [Continue]/[Discard] prompt existed only on the post-pipeline path (after the
+  reviewer's verdict) and in the watcher. The three checks that fire *between*
+  stages — the token cap, the per-stage cost cap, and the pair check after the
+  parallel tester+security run — wrote `stage="failed"`, announced
+  `FAILED: cost cap hit…` and returned rc=5, so the task was carried off to
+  `failed/`. Caps are tuned empirically and will fire; every such stop is a
+  designed gate, and `failed` misreported it. Reviving one of those tasks meant
+  editing `state.json` by hand instead of one tap on Continue.
+
+  All three now go through a single branch, `_cap_stop()`, which writes the
+  worklog and history breadcrumbs and then calls `budget_gate.park()`. The
+  park's `budget_stop` notification *replaces* the FAILED message rather than
+  adding to it, so a cap stop still emits exactly one terminal message.
+  `ARCHITECTURE.md` §5 already described this behavior — the code now matches
+  the document.
+
+  Two consequences worth naming. The parallel pair parks once: its two stages
+  run concurrently, so whichever hit the cap first used to send its own FAILED
+  line — a second message for one stop — and, now that parking moves the task
+  directory, would have pulled it out from under a stage still writing to it;
+  the children record the stop and the single park happens after both have
+  joined. And `token_cap` becomes its own stop reason instead of reporting as
+  `cost_cap`, so the prompt names the cap that actually stopped the run.
+
+  The rc=5 pass-through in `_terminate_pipeline` is unchanged: the graceful
+  handoff still must not reclassify a budget abort, and rc=5 now short-circuits
+  for the same reason the clarification pause does — the task has already moved
+  itself. Continue needed no change (it bumps the caps in `spec.json` and
+  bounces the task to `inbox/`, which never depended on a reviewer verdict or an
+  open PR), and the watcher already refuses to respawn `awaiting-input`.
+- **Public mirror history reset to a sanitized baseline.** The mirror's
+  previous 13-commit history is replaced by a single baseline commit built
+  by the gated export from the current tree; the old tags were dropped.
+  Early commits predated the export gate and carried internal material
+  that was stripped from HEAD long ago but stayed reachable in history,
+  and release commits carried cross-project references; commit authorship
+  moved to the GitHub noreply address. Content matches the v1.0.2 release
+  plus the sanitization fixes; granular per-change history resumes from
+  the new baseline. The publish blocklist and the pre-push hook now derive
+  personal markers instead of hardcoding them, so the export can never
+  carry the strings the gate exists to block.
 
 - **CI added (`.github/workflows/ci.yml`).** The repo had no workflows at all —
   `git log --all -- .github` is empty and the GitHub API listed only the

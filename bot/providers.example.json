@@ -1,0 +1,23 @@
+{
+  "_doc": "Provider key profiles — named keys for one provider (T15). Copy to providers.json (gitignored, like projects.json) and edit for this host. Absent file = the pipeline uses the global DEEPSEEK_API_KEY / GLM_API_KEY from bot/.env, exactly as before profiles existed.",
+  "_secrets": "This file holds NO secrets and must not: a profile points at an env var (api_key_env, filled from bot/.env) or a file (api_key_file, relative to the repo root or absolute). A JSON of raw keys would just be a second .env without the protection the first one has.",
+  "_selection": "Per task: model_routing values may name a profile after a colon (\"deepseek:alt\"). Per session: /backend deepseek:alt in Telegram, which writes provider_profile into every new spec. Neither given: defaults.<backend> below.",
+  "profiles": {
+    "deepseek-main": {
+      "backend": "deepseek",
+      "api_key_env": "DEEPSEEK_API_KEY"
+    },
+    "deepseek-alt": {
+      "backend": "deepseek",
+      "api_key_env": "DEEPSEEK_API_KEY_ALT",
+      "base_url": "https://api.deepseek.com/anthropic"
+    },
+    "glm-work": {
+      "backend": "glm",
+      "api_key_file": ".secrets/glm-work.key"
+    }
+  },
+  "defaults": {
+    "deepseek": "deepseek-main"
+  }
+}

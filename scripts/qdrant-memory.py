@@ -11,14 +11,22 @@ WHY THIS EXISTS
     The payloads, though, are text. This script moves the text in and out of
     JSONL so memory can be committed, diffed, reviewed, and rebuilt anywhere:
 
-        dump     Qdrant  -> JSONL   (payloads only; vectors are not exported)
+        dump     Qdrant  -> JSONL   (payloads only; --with-vectors adds them)
         restore  JSONL   -> Qdrant  (re-embeds each record through TEI)
         stats    describe either side without changing anything
 
-    Vectors are deliberately NOT exported. They are a derived artifact: 1024
-    floats per point that bloat the file, cannot be reviewed, and are invalid
-    the moment the embedding model changes. Re-embedding on restore is cheap
-    and always consistent with whatever model is serving at the time.
+    Vectors are NOT exported by default, for the reason they never were: they
+    are a derived artifact — 1024 floats per point that bloat the file, cannot
+    be reviewed, and are invalid the moment the embedding model changes.
+    Re-embedding on restore is cheap and consistent with whatever model is
+    serving at the time.
+
+    `--with-vectors` exists for one purpose (T13): the flat store that replaces
+    Qdrant IS this file with its vectors, so `dispatcher/memory_flat.py` needs
+    an export that carries them. Two consequences worth knowing before running
+    it: the file grows by roughly 3 MB per 800 points, and it stops being
+    reviewable in a diff. Keep the payload-only export as the committed,
+    readable copy; write the vector export where MEMORY_FLAT_PATH points.
 
 INFRASTRUCTURE
     Qdrant  (default http://127.0.0.1:6333) — dump and restore
@@ -42,6 +50,7 @@ SECRET GATE
 
 Usage:
     scripts/qdrant-memory.py dump    [--out PATH] [--exclude-flagged]
+                                     [--with-vectors]
     scripts/qdrant-memory.py restore [--in PATH] [--dry-run] [--overwrite]
     scripts/qdrant-memory.py purge   [--flagged] [--yes]
     scripts/qdrant-memory.py stats   [--in PATH]
@@ -69,6 +78,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EXPORT = REPO_ROOT / "memory-bank" / "semantic-export" / "meta_agent_mem.jsonl"
+# The vector export is a different file with a different job: it IS the flat
+# store dispatcher/memory_flat.py reads, so its name and shape are that
+# module's contract, not a formatting preference.
+DEFAULT_VECTOR_EXPORT = DEFAULT_EXPORT.with_name("meta_agent_mem.vectors.jsonl")
 
 # TEI advertises max_client_batch_size=32; batching above it is rejected.
 EMBED_BATCH = 32
@@ -228,7 +241,7 @@ def http_json(url: str, body: "dict | None" = None, method: str = "POST",
 # dump
 # ---------------------------------------------------------------------------
 
-def scroll_all(collection: str) -> "list[dict]":
+def scroll_all(collection: str, with_vectors: bool = False) -> "list[dict]":
     """Every point in the collection, payloads only, following the cursor to
     the end. Qdrant returns `next_page_offset: null` on the last page."""
     base = f"{qdrant_url()}/collections/{collection}/points/scroll"
@@ -237,7 +250,7 @@ def scroll_all(collection: str) -> "list[dict]":
     page = 0
     while True:
         body: dict = {"limit": SCROLL_PAGE, "with_payload": True,
-                      "with_vector": False}
+                      "with_vector": with_vectors}
         if offset is not None:
             body["offset"] = offset
         out = http_json(base, body)
@@ -254,7 +267,12 @@ def scroll_all(collection: str) -> "list[dict]":
 
 def cmd_dump(args: argparse.Namespace) -> int:
     collection = args.collection
-    out_path = Path(args.out)
+    # Two exports, two destinations: the payload-only file is the committed,
+    # reviewable copy; the vector file is the live flat store. Defaulting them
+    # to the same name would overwrite one with the other — which is what the
+    # first cut of --with-vectors did.
+    out_path = Path(args.out) if args.out else (
+        DEFAULT_VECTOR_EXPORT if args.with_vectors else DEFAULT_EXPORT)
 
     try:
         info = http_json(f"{qdrant_url()}/collections/{collection}",
@@ -266,7 +284,7 @@ def cmd_dump(args: argparse.Namespace) -> int:
     log(f"collection '{collection}': {reported} point(s) reported")
 
     try:
-        points = scroll_all(collection)
+        points = scroll_all(collection, with_vectors=bool(args.with_vectors))
     except RuntimeError as exc:
         die(str(exc))
 
@@ -278,8 +296,30 @@ def cmd_dump(args: argparse.Namespace) -> int:
     # real changes rather than Qdrant's internal iteration order.
     points.sort(key=lambda p: str(p.get("id")))
 
-    records = [{"id": p.get("id"), "payload": p.get("payload") or {}}
-               for p in points]
+    if args.with_vectors:
+        # {"id", "vector", "payload"} — the shape memory_flat.load() requires.
+        # A point whose vector did not come back is dropped rather than written
+        # without one: memory_flat skips vectorless rows, so writing them would
+        # produce a store that silently holds fewer points than the file shows.
+        records = []
+        dropped = 0
+        for p in points:
+            vector = p.get("vector")
+            if isinstance(vector, dict):        # named-vector collections
+                vector = next(iter(vector.values()), None)
+            if not isinstance(vector, list) or not vector:
+                dropped += 1
+                continue
+            records.append({"id": p.get("id"), "vector": vector,
+                            "payload": p.get("payload") or {}})
+        if dropped:
+            log(f"warn: {dropped} point(s) came back without a vector — omitted")
+        if not records:
+            die("no point carried a vector — is this collection empty of "
+                "embeddings, or did the scroll drop them?", 3)
+    else:
+        records = [{"id": p.get("id"), "payload": p.get("payload") or {}}
+                   for p in points]
 
     # Secret gate — fail closed. The export is destined for git, so a finding
     # blocks the write rather than warning about it. Scanning happens on the
@@ -569,6 +609,73 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ephemeral_predicate():
+    """The one definition of "ephemeral target", imported, never re-implemented.
+
+    `dispatcher/memory_inject._is_ephemeral_target` is what write-back has
+    refused since T02, so a purge built on anything else would delete a
+    different set than the guard prevents — two rules drifting apart is exactly
+    what put this garbage in the store to begin with.
+    """
+    here = Path(__file__).resolve().parent.parent / "dispatcher"
+    sys.path.insert(0, str(here))
+    from memory_inject import _is_ephemeral_target   # noqa: E402
+    return _is_ephemeral_target
+
+
+def cmd_purge_ephemeral(args: argparse.Namespace) -> int:
+    """Drop points whose target_repo was a throwaway temp directory.
+
+    These predate the T02 write-back guard (2026-08-20): runner-level tests
+    that reached pipeline completion while a store was listening wrote a real
+    `task_lesson` for a `$TMPDIR` fixture. No new ones appear, but the old ones
+    dilute every recall — the scoped half of `recall()` filters by
+    `target_repo`, and these are targets that no longer exist.
+
+    Selection is by `target_repo` ONLY, deliberately. Widening it to "any temp
+    path mentioned anywhere in the record" also catches real session summaries
+    that merely quote a path in passing — six of them in the 2026-08-28 export,
+    including operator hand-off notes. Those are content, not residue.
+    """
+    is_ephemeral = _ephemeral_predicate()
+    targets = [Path(p) for p in (args.files or
+                                 [DEFAULT_EXPORT, DEFAULT_VECTOR_EXPORT])]
+
+    total_removed = 0
+    for path in targets:
+        if not path.exists():
+            log(f"{path.name}: not present, skipped "
+                f"(the vectors file is gitignored and lives on the host)")
+            continue
+        records = read_jsonl(path)
+        keep, drop = [], []
+        for rec in records:
+            payload = rec.get("payload") or rec
+            (drop if is_ephemeral(payload.get("target_repo") or "") else
+             keep).append(rec)
+
+        log(f"{path.name}: {len(records)} record(s), {len(drop)} ephemeral")
+        for rec in drop:
+            payload = rec.get("payload") or rec
+            text = " ".join((payload.get("text") or "").split())[:80]
+            log(f"    {str(rec.get('id'))[:8]}  {text}")
+
+        if not drop:
+            continue
+        if not args.yes:
+            log(f"    dry run — pass --yes to rewrite {path.name}")
+            continue
+        write_jsonl(path, keep)
+        log(f"    rewrote {path.name}: {len(records)} -> {len(keep)}")
+        total_removed += len(drop)
+
+    if args.yes and total_removed:
+        log(f"removed {total_removed} record(s) in total.")
+        log("The live flat store is a separate file on the host "
+            "(MEMORY_FLAT_PATH); run this there too, or recall keeps serving them.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="qdrant-memory.py",
@@ -579,10 +686,19 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_dump = sub.add_parser("dump", help="Qdrant -> JSONL")
-    p_dump.add_argument("--out", default=str(DEFAULT_EXPORT))
+    p_dump.add_argument("--out", default=None,
+                        help=f"default: {DEFAULT_EXPORT} (payload-only) or "
+                             f"{DEFAULT_VECTOR_EXPORT} with --with-vectors")
     p_dump.add_argument("--exclude-flagged", action="store_true",
                         help="write the export without records that trip the "
                              "secret gate, instead of refusing outright")
+    p_dump.add_argument("--with-vectors", action="store_true",
+                        help="include the embedding vectors. The default export "
+                             "is payload-only, so it can only be restored by "
+                             "RE-EMBEDDING every text through TEI — and it "
+                             "cannot serve as the flat store at all. Pass this "
+                             "to produce the file MEMORY_FLAT_PATH points at "
+                             "(T13); expect ~3 MB per 800 points.")
     p_dump.set_defaults(func=cmd_dump)
 
     p_purge = sub.add_parser(
@@ -593,6 +709,16 @@ def main() -> int:
     p_purge.add_argument("--yes", action="store_true",
                          help="actually delete; without it this is a dry run")
     p_purge.set_defaults(func=cmd_purge)
+
+    p_pe = sub.add_parser(
+        "purge-ephemeral",
+        help="drop points whose target_repo was a throwaway temp directory")
+    p_pe.add_argument("files", nargs="*",
+                      help=f"JSONL files to clean (default: {DEFAULT_EXPORT.name} "
+                           f"and {DEFAULT_VECTOR_EXPORT.name})")
+    p_pe.add_argument("--yes", action="store_true",
+                      help="actually rewrite the files; without it this is a dry run")
+    p_pe.set_defaults(func=cmd_purge_ephemeral)
 
     p_restore = sub.add_parser("restore", help="JSONL -> Qdrant (re-embeds)")
     p_restore.add_argument("--in", dest="infile", default=str(DEFAULT_EXPORT))

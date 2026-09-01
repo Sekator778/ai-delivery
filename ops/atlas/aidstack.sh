@@ -6,16 +6,31 @@
 # ops/atlas/README.md for what is and isn't covered.
 #
 # Usage:
-#   aidstack.sh up       start mem0 (Qdrant), ensure bot/venv, then start the
+#   aidstack.sh pull     take the newest commit of the checked-out branch, if
+#                        there is one and nothing is in the way (no-op otherwise)
+#   aidstack.sh up       pull (see above), then start mem0 (Qdrant), ensure bot/venv, then start the
 #                        dispatcher + watcher daemons and the Telegram bot
 #                        (bot only if bot/.env has a real TELEGRAM_BOT_TOKEN)
+#   aidstack.sh restart  THE DEPLOY COMMAND. Stop the daemons, take the newest
+#                        commit, start again — so the running processes actually
+#                        execute the code that was just pulled. `up` alone does
+#                        not: it leaves a live daemon running the old code.
+#                        Refuses while a task runner is alive; --wait waits for
+#                        it, --force goes ahead anyway.
 #   aidstack.sh down     stop the daemons (TERM, then KILL fallback), kill any
 #                        orphaned claude children left behind (#18), stop the
-#                        mem0 compose stack (volumes kept), release the Docker
-#                        engine if nothing else needs it
-#   aidstack.sh status   daemon pidfile liveness + container status + qdrant
-#                        and TEI health
+#                        mem0 compose stack (volumes kept — also the rollback
+#                        path out of the flat store), release the Docker engine
+#                        if nothing else needs it
+#   aidstack.sh status   daemon pidfile liveness + TEI health, plus either the
+#                        container/qdrant state or the flat memory store,
+#                        depending on MEMORY_FLAT_ENABLED (T13/T17)
 #   aidstack.sh logs [dispatcher|watcher|bot]   tail -f the daemon log (default: dispatcher)
+#
+# Flags for restart/down:
+#   --force              act even while a task runner is alive (says so)
+#   --wait               wait for active runners to finish first
+#                        (AIDSTACK_WAIT_TIMEOUT seconds, default 3600)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -56,6 +71,14 @@ memory_url() {
 }
 
 QDRANT_URL="$(memory_url MEMORY_QDRANT_URL http://127.0.0.1:6333)"
+# Flat semantic store (T13): when it is on, Qdrant is not part of this stack at
+# all — do not start it, do not health-check it. The container and its volume
+# stay on disk as the rollback path for as long as the flag exists.
+MEMORY_FLAT_ENABLED="$(memory_url MEMORY_FLAT_ENABLED "")"
+MEMORY_FLAT_PATH="$(memory_url MEMORY_FLAT_PATH \
+  "$REPO_ROOT/memory-bank/semantic-export/meta_agent_mem.vectors.jsonl")"
+
+flat_memory() { [ "$MEMORY_FLAT_ENABLED" = "1" ]; }
 TEI_URL="$(memory_url MEMORY_TEI_URL http://127.0.0.1:8087)"
 # launchd label of the external TEI agent (owned by another project on this
 # host) — lets the TEI warnings print the exact start command. Optional.
@@ -123,6 +146,8 @@ stop_docker_engine() {
   "$orb" stop
 }
 
+# shellcheck disable=SC2120  # the retry count is an override for callers
+# that want one; every current call site takes the default.
 wait_qdrant() {
   local tries="${1:-60}"
   log "waiting for qdrant ..."
@@ -159,6 +184,8 @@ wait_qdrant() {
 # Probe /info, not /health: TEI serves no /health endpoint, so probing it
 # returns nothing and reads as "down" on a perfectly healthy server. GET /info
 # returns the model card ({"model_id":"BAAI/bge-m3",...}).
+# shellcheck disable=SC2120  # the retry count is an override for callers
+# that want one; every current call site takes the default.
 wait_tei() {
   local tries="${1:-5}"
   log "checking the TEI embedding server ..."
@@ -241,6 +268,99 @@ pidfile_alive() {
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
+# ---------------------------------------------------------------------------
+# Live task runners.
+#
+# Answered by dispatcher/runner_liveness.py, never reimplemented here. The
+# check is not `kill -0`: a pidfile outlives its process and pids get reused,
+# so the module also matches the process command line against the runner script
+# and the task id. A bash approximation would call a recycled pid a live runner
+# and block restarts forever — and, worse, could disagree with what the watcher
+# believes about the same task.
+# ---------------------------------------------------------------------------
+live_runners() {
+  local py="$VENV_PY"
+  [ -x "$py" ] || py="$(command -v python3 || true)"
+  if [ -z "$py" ]; then
+    # Unknown is not empty. Callers treat a non-zero return as "cannot tell".
+    return 2
+  fi
+  "$py" "$REPO_ROOT/dispatcher/runner_liveness.py" "$REPO_ROOT/tasks/active" 2>/dev/null
+}
+
+# Refuse when a task is mid-flight, unless --force.
+# A stage killed halfway is a paid Claude call thrown away: one fully green
+# task cost $14.56 (8f7619e), and the watcher resuming from state.json does not
+# refund it.
+guard_live_runners() {
+  local action="$1" running rc=0
+  running="$(live_runners)" || rc=$?
+
+  if [ "$rc" = "2" ]; then
+    if [ "$FORCE" = "1" ]; then
+      warn "$action: cannot tell whether a runner is live (no python3) - proceeding (--force)"
+      return 0
+    fi
+    warn "$action: cannot tell whether a task runner is live (no python3 available)."
+    warn "  Unknown is not the same as idle. Re-run with --force to proceed anyway."
+    return 1
+  fi
+
+  [ -n "$running" ] || return 0
+
+  if [ "$WAIT_FOR_RUNNERS" = "1" ]; then
+    wait_for_runners "$action" || return 1
+    return 0
+  fi
+
+  if [ "$FORCE" = "1" ]; then
+    warn "$action: proceeding over $(printf '%s\n' "$running" | wc -l | tr -d ' ') live runner(s) (--force):"
+    printf '%s\n' "$running" | sed 's/^/    /' >&2
+    return 0
+  fi
+
+  warn "$action: refused - a task runner is live:"
+  printf '%s\n' "$running" | sed 's/^/    /' >&2
+  warn "  Killing a stage mid-flight throws away a paid Claude call."
+  warn "  Wait for it:  aidstack.sh $action --wait"
+  warn "  Or override:  aidstack.sh $action --force"
+  return 1
+}
+
+wait_for_runners() {
+  local action="$1" timeout="${AIDSTACK_WAIT_TIMEOUT:-3600}" waited=0 running rc=0
+  log "$action: waiting up to ${timeout}s for active runners to finish"
+  while :; do
+    running="$(live_runners)" || rc=$?
+    if [ "$rc" = "2" ]; then
+      warn "$action: lost the ability to check for live runners - not waiting blind"
+      return 1
+    fi
+    [ -n "$running" ] || { log "$action: no live runners left after ${waited}s"; return 0; }
+    if [ "$waited" -ge "$timeout" ]; then
+      # Timing out into --force would be the silent kill this guard exists to
+      # prevent, so it is a refusal.
+      warn "$action: still running after ${timeout}s:"
+      printf '%s\n' "$running" | sed 's/^/    /' >&2
+      warn "  Giving up rather than killing them. Raise AIDSTACK_WAIT_TIMEOUT or use --force."
+      return 1
+    fi
+    sleep 10
+    waited=$((waited + 10))
+  done
+}
+
+# Which daemons were already alive when this command started. Captured before
+# anything starts, because start_daemon() makes "was already up" and "just
+# started it" indistinguishable afterwards.
+daemons_already_running() {
+  local name out=""
+  for name in "${DAEMONS[@]}"; do
+    pidfile_alive "$PID_DIR/$name.pid" && out="$out $name"
+  done
+  printf '%s' "${out# }"
+}
+
 rotate_log() {
   local logfile="$1"
   [ -f "$logfile" ] && mv -f "$logfile" "$logfile.prev"
@@ -271,7 +391,14 @@ start_daemon() {
 }
 
 stop_daemon() {
-  local name="$1" pidfile="$PID_DIR/$name.pid" pid
+  # Two statements, not one: in a single `local`, the right-hand sides are
+  # all evaluated before any assignment takes effect, so "$name" here would
+  # be the CALLER's name — empty unless the caller happens to have one.
+  # Both call sites loop over a variable literally called `name`, so this
+  # worked by accident of dynamic scoping; renaming that loop variable would
+  # have silently pointed every lookup at "$PID_DIR/.pid" (SC2318).
+  local name="$1"
+  local pidfile="$PID_DIR/$name.pid" pid
   if [ ! -f "$pidfile" ]; then
     log "$name is not running (no pidfile)"
     return 0
@@ -301,7 +428,14 @@ stop_daemon() {
 }
 
 daemon_status() {
-  local name="$1" pidfile="$PID_DIR/$name.pid" pid
+  # Two statements, not one: in a single `local`, the right-hand sides are
+  # all evaluated before any assignment takes effect, so "$name" here would
+  # be the CALLER's name — empty unless the caller happens to have one.
+  # Both call sites loop over a variable literally called `name`, so this
+  # worked by accident of dynamic scoping; renaming that loop variable would
+  # have silently pointed every lookup at "$PID_DIR/.pid" (SC2318).
+  local name="$1"
+  local pidfile="$PID_DIR/$name.pid" pid
   if [ -f "$pidfile" ] && pid="$(cat "$pidfile" 2>/dev/null)" && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     log "$name: RUNNING (pid=$pid)"
   else
@@ -351,12 +485,115 @@ start_bot() {
 # Commands
 # ---------------------------------------------------------------------------
 
-cmd_up() {
-  start_docker_engine || return 1
+# ---------------------------------------------------------------------------
+# pull_latest - take the newest version of the checked-out branch before start.
+#
+# Starting the stand IS the deploy trigger. There is nothing in the background:
+# you run `aidup`, it looks whether the branch you are on moved on the remote,
+# takes it if so, and starts. If there is nothing new — or anything at all is
+# in the way — it starts what is already checked out.
+#
+# EVERY path returns 0 on purpose. The job of this command is to bring the
+# stand up; the update is opportunistic. A stand that refuses to start because
+# git had an opinion is worse than a stand running last week's code, and you
+# are standing right here reading the output either way.
+#
+# It follows whatever branch the checkout is on, so there is no branch name
+# configured in two places. AIDUP_PULL=0 skips it entirely.
+# ---------------------------------------------------------------------------
+# Set by pull_latest when it actually moved HEAD. cmd_up reads it to tell the
+# operator whether the daemons they are looking at are running the code that
+# was just pulled — see the split-brain warning there.
+PULL_MOVED=0
 
-  log "starting containers"
-  "${COMPOSE[@]}" up -d
-  wait_qdrant
+pull_latest() {
+  PULL_MOVED=0
+  if [ "${AIDUP_PULL:-1}" != "1" ]; then
+    log "update: skipped (AIDUP_PULL=0)"
+    return 0
+  fi
+
+  local branch local_sha remote_sha behind
+  branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+  if [ -z "$branch" ]; then
+    warn "update: not a git checkout - starting with what is on disk"
+    return 0
+  fi
+  if [ "$branch" = "HEAD" ]; then
+    warn "update: detached HEAD - starting with what is checked out"
+    return 0
+  fi
+  if ! git -C "$REPO_ROOT" diff --quiet HEAD -- 2>/dev/null; then
+    warn "update: uncommitted changes - starting with what is checked out"
+    return 0
+  fi
+  if ! git -C "$REPO_ROOT" fetch --quiet origin "$branch" 2>/dev/null; then
+    warn "update: fetch failed (offline?) - starting with what is checked out"
+    return 0
+  fi
+
+  local_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  remote_sha="$(git -C "$REPO_ROOT" rev-parse FETCH_HEAD)"
+
+  if [ "$local_sha" = "$remote_sha" ]; then
+    log "update: already at origin/$branch $(git -C "$REPO_ROOT" rev-parse --short HEAD) - nothing new"
+    return 0
+  fi
+
+  if git -C "$REPO_ROOT" merge-base --is-ancestor "$local_sha" "$remote_sha"; then
+    behind="$(git -C "$REPO_ROOT" rev-list --count "$local_sha..$remote_sha")"
+    log "update: origin/$branch has $behind new commit(s) - taking them"
+    if git -C "$REPO_ROOT" merge --ff-only "$remote_sha" >/dev/null 2>&1; then
+      PULL_MOVED=1
+      log "update: now at $(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+    else
+      warn "update: fast-forward failed - starting with what is checked out"
+    fi
+  elif git -C "$REPO_ROOT" merge-base --is-ancestor "$remote_sha" "$local_sha"; then
+    warn "update: local $branch is ahead of origin (unpushed commits) - starting as is"
+  else
+    warn "update: local $branch and origin/$branch diverged - starting as is"
+  fi
+  return 0
+}
+
+cmd_up() {
+  local was_running
+  was_running="$(daemons_already_running)"
+
+  pull_latest
+
+  # The one thing `up` cannot do, said out loud — and said HERE, right after the
+  # pull, so it does not depend on the rest of this function succeeding.
+  #
+  # start_daemon() is idempotent: a live daemon is left exactly as it was. So
+  # when the pull moved the checkout while daemons were already running, the
+  # code on disk is new and those processes still execute the modules they
+  # imported at start. Stages spawned from now on are fresh processes that DO
+  # read the new code — as are the persona and prompt files, read per stage — so
+  # the orchestrator and the stages it orchestrates end up on different versions
+  # of this repository.
+  #
+  # Without this the output is indistinguishable from a successful deploy, which
+  # is how "aidup means deployed" became a belief that is false on a live stand.
+  if [ "$PULL_MOVED" = "1" ] && [ -n "$was_running" ]; then
+    warn "deploy: NOT applied to daemons already running: $was_running"
+    warn "  New code is on disk; those processes still run the code they started with,"
+    warn "  while newly spawned stages read the new code. Mixed versions."
+    warn "  To actually deploy:  aidstack.sh restart --wait"
+  fi
+
+  if flat_memory; then
+    # The only service in this compose file is qdrant, and the flat store
+    # replaced it. Starting it would resurrect ~0.5 MB/s of background disk
+    # reads for 810 points nobody queries any more.
+    log "memory: flat store ($MEMORY_FLAT_PATH) - skipping the qdrant container"
+  else
+    start_docker_engine || return 1
+    log "starting containers"
+    "${COMPOSE[@]}" up -d
+    wait_qdrant
+  fi
 
   # Never fatal: TEI is genuinely optional and owned by another project, and
   # the pipeline runs without it. The stack comes up either way.
@@ -386,6 +623,20 @@ cmd_up() {
   cmd_status
 }
 
+# ---------------------------------------------------------------------------
+# cmd_restart - the deploy command.
+#
+# `up` starts what is not running; it deliberately never touches a live daemon.
+# That makes it the wrong tool for taking new code into a running stand, and
+# there was no right one — which is the gap this fills. Guarded, because
+# restarting is the operation that kills work in flight.
+# ---------------------------------------------------------------------------
+cmd_restart() {
+  guard_live_runners restart || return 1
+  cmd_down
+  cmd_up
+}
+
 # A claude child whose runner was killed survives re-parented to init (ppid 1)
 # and keeps burning the subscription — 3h11m unnoticed on 2026-08-14 (#18).
 # Bringing the stack down must not leave one behind. The matcher (ppid==1, no
@@ -403,6 +654,8 @@ sweep_orphan_children() {
 }
 
 cmd_down() {
+  guard_live_runners down || return 1
+
   local name
   for name in "${DAEMONS[@]}"; do
     stop_daemon "$name"
@@ -426,17 +679,31 @@ cmd_status() {
     daemon_status "$name"
   done
 
-  log "containers"
-  if docker info >/dev/null 2>&1; then
-    "${COMPOSE[@]}" ps --format 'table {{.Name}}\t{{.Service}}\t{{.Status}}'
+  if flat_memory; then
+    # No containers to report: the flat store is a file, and TEI below is
+    # external to this stack. What can break here is the file going missing.
+    if [ -s "$MEMORY_FLAT_PATH" ]; then
+      log "memory: flat store $MEMORY_FLAT_PATH ($(wc -l <"$MEMORY_FLAT_PATH" | tr -d ' ') points, $(du -h "$MEMORY_FLAT_PATH" | cut -f1), modified $(date -r "$MEMORY_FLAT_PATH" '+%Y-%m-%d %H:%M'))"
+    elif [ -e "$MEMORY_FLAT_PATH" ]; then
+      warn "memory: flat store $MEMORY_FLAT_PATH is EMPTY - recall returns nothing"
+      warn "  Rebuild it:  scripts/qdrant-memory.py dump --with-vectors  (needs qdrant up)"
+    else
+      warn "memory: flat store $MEMORY_FLAT_PATH is MISSING - recall returns nothing"
+      warn "  Rebuild it:  scripts/qdrant-memory.py dump --with-vectors  (needs qdrant up)"
+    fi
   else
-    warn "the Docker engine is not running"
-  fi
+    log "containers"
+    if docker info >/dev/null 2>&1; then
+      "${COMPOSE[@]}" ps --format 'table {{.Name}}\t{{.Service}}\t{{.Status}}'
+    else
+      warn "the Docker engine is not running"
+    fi
 
-  if curl -fsS -o /dev/null -m 2 "$QDRANT_URL/collections" 2>/dev/null; then
-    log "qdrant: healthy on $QDRANT_URL"
-  else
-    warn "qdrant: not reachable on $QDRANT_URL"
+    if curl -fsS -o /dev/null -m 2 "$QDRANT_URL/collections" 2>/dev/null; then
+      log "qdrant: healthy on $QDRANT_URL"
+    else
+      warn "qdrant: not reachable on $QDRANT_URL"
+    fi
   fi
 
   if curl -fsS -o /dev/null -m 2 "$TEI_URL/info" 2>/dev/null; then
@@ -457,11 +724,27 @@ cmd_logs() {
   tail -f "$logfile"
 }
 
-case "${1:-status}" in
-  up)     cmd_up ;;
-  down)   cmd_down ;;
-  status) cmd_status ;;
-  logs)   shift; cmd_logs ${1+"$@"} ;;
+FORCE=0
+WAIT_FOR_RUNNERS=0
+
+CMD="${1:-status}"
+[ $# -gt 0 ] && shift
+ARGS=()
+for arg in ${1+"$@"}; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    --wait)  WAIT_FOR_RUNNERS=1 ;;
+    *)       ARGS+=("$arg") ;;
+  esac
+done
+
+case "$CMD" in
+  up)      cmd_up ;;
+  pull)    pull_latest ;;
+  restart) cmd_restart ;;
+  down)    cmd_down ;;
+  status)  cmd_status ;;
+  logs)    cmd_logs ${ARGS+"${ARGS[@]}"} ;;
   # Print the header comment block, whatever length it happens to be.
-  *)      awk 'NR>1 && /^#/ { print; next } NR>1 { exit }' "${BASH_SOURCE[0]}"; exit 1 ;;
+  *)       awk 'NR>1 && /^#/ { print; next } NR>1 { exit }' "${BASH_SOURCE[0]}"; exit 1 ;;
 esac

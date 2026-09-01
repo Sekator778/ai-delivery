@@ -25,7 +25,7 @@ agent pipeline carries it to a GitHub pull request on the target repository.
 One human gate: the merge.
 
 The framework runs from this repo on macOS (`ops/atlas/aidstack.sh`: three
-daemons + a Qdrant container) or Linux (`ops/systemd/` units). Multiple tasks
+daemons) or Linux (`ops/systemd/` units). Multiple tasks
 run in parallel (default cap 3), each in its own runner process and its own
 git worktree of the target.
 
@@ -170,14 +170,21 @@ operator decision instead of killing it.
 | Layer | Scope | Managed by |
 |---|---|---|
 | `memory-bank/` in each target repo | per-project facts (goal, stack, decisions) | git; post-merge auto-append of a one-liner |
-| Pipeline memory (Qdrant + TEI) | cross-task lessons, typed + scoped | the runner, `dispatcher/memory_inject.py` |
+| Pipeline memory (flat JSONL + TEI) | cross-task lessons, typed + scoped | the runner, `dispatcher/memory_inject.py` |
 | Claude Code auto-memory | operator-session behavior | the Claude Code harness |
 | `STATE/` (private) | this repo's own development | by hand, every meaningful change |
 
 The pipeline layer is the working one (memory-inject, roadmap #0, live
-since 2026-08-15). Both halves run inside the runner, on stdlib HTTP
-against local services (TEI `bge-m3` :8087 + Qdrant :6333, no new
-dependencies):
+since 2026-08-15). Both halves run inside the runner, with no new
+dependencies. The store behind them is a single JSONL file —
+`memory-bank/semantic-export/meta_agent_mem.vectors.jsonl`, one
+`{id, vector, payload}` record per line, scanned with a stdlib cosine
+top-k (`dispatcher/memory_flat.py`, `MEMORY_FLAT_ENABLED=1`). The one
+service still required is TEI `bge-m3` :8087, over stdlib HTTP: the query
+has to be embedded. Qdrant was the store until 2026-08-21 (T13 verdict:
+600 MB and two always-on services for 810 points, ~40 GB/day of idle disk
+reads); with the flag off the Qdrant path is still there, kept as the
+rollback.
 
 - **Write-back:** every completed pipeline writes one typed `task_lesson`
   record (`{kind, target_repo, tier, stop_reason, pr_url, summary}`).
@@ -189,9 +196,10 @@ dependencies):
   failure degrades to `(none)` — a stage never blocks on memory.
 
 The predecessor — four mem0 lifecycle hooks in `.claude/settings.json` —
-was removed 2026-08-17 after months dead; the points it once wrote remain
-in Qdrant and are served by the global recall. The bot's `/memo` and
-`/recall` commands are a self-contained manual layer over the same store.
+was removed 2026-08-17 after months dead; the points it once wrote came
+across in the migration and are served by the global recall. The bot's
+`/memo` and `/recall` commands are a manual layer over the same store,
+through `memory_inject` rather than a store of their own.
 
 ---
 
@@ -215,8 +223,11 @@ in Qdrant and are served by the global recall. The bot's `/memo` and
 - **PoC seatbelt** — targets outside `MERGEABLE_REPO_PATHS` (in `bot/.env`)
   run in PoC mode: PRs are opened but never merged by the pipeline.
 - **Secrets** — never flow through prompts: env-injection only, log
-  redaction on the bot, gitleaks + blocklist scans before anything reaches
-  the public mirror (`scripts/publish-public.sh`).
+  redaction on the bot, gitleaks in CI on every push and pull request, plus
+  the two-scan export gate `scripts/publish-public.sh` (gitleaks + project
+  blocklist) that anything would have to pass to reach the public mirror.
+  Publication is paused since 2026-08-21; the mirror is live, so the rule
+  "never push there" stands.
 
 ---
 
@@ -240,14 +251,15 @@ trace (memory injections and write-backs log there too).
 ## 9. Deploy and operations
 
 - **macOS (current):** `ops/atlas/aidstack.sh` up/down/status/logs (shell
-  aliases `aidup`/`aiddown`/`aidstatus`/`aidlogs`). Up: Qdrant container +
-  dispatcher + watcher + bot, each sourcing `bot/.env`. Down: daemons, then
-  the orphan sweep.
+  aliases `aidup`/`aiddown`/`aidstatus`/`aidlogs`). Up: dispatcher +
+  watcher + bot, each sourcing `bot/.env` (plus the Qdrant container only
+  when `MEMORY_FLAT_ENABLED` is off). Down: daemons, then the orphan
+  sweep.
 - **Linux:** the same three daemons as `ops/systemd/` units;
   `ops/INSTALL.md` is the full walkthrough.
 - **Optional stacks** under `services/stacks/`: voice (Whisper STT +
   Silero TTS) and Windmill (scheduling); the pipeline itself needs only
-  bot + dispatcher + watcher + `claude` + `gh` + Qdrant/TEI.
+  bot + dispatcher + watcher + `claude` + `gh` + TEI.
 
 ---
 

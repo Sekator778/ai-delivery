@@ -150,6 +150,38 @@ def _make_fixture() -> tuple[Path, Path, Path]:
     return src, mirror, tmproot
 
 
+def _add_source_origin(src: Path, tmproot: Path) -> Path:
+    """Give the fixture an `origin` remote holding the same dev tip.
+
+    _make_fixture deliberately leaves `src` with only the mirror remote, so the
+    freshness check (T23) reports "nothing to be stale against" and every older
+    test keeps passing untouched. The freshness tests need the opposite, so they
+    opt in by calling this.
+    """
+    origin = tmproot / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-b", "dev", str(origin)],
+                   capture_output=True, check=True)
+    _git(src, "remote", "add", "origin", str(origin))
+    _git(src, "push", "origin", "dev")
+    return origin
+
+
+def _advance_origin(src: Path, message: str) -> None:
+    """Push one commit to origin/dev without moving the local dev branch."""
+    _git(src, "checkout", "-q", "-b", "_ahead")
+    (src / "README.md").write_text((src / "README.md").read_text() + message + "\n")
+    _git(src, "commit", "-qam", message)
+    _git(src, "push", "-q", "origin", "_ahead:dev")
+    _git(src, "checkout", "-q", "dev")
+    _git(src, "branch", "-qD", "_ahead")
+
+
+def _commit_locally(src: Path, message: str) -> None:
+    """Add one commit to local dev that origin does not have."""
+    (src / "README.md").write_text((src / "README.md").read_text() + message + "\n")
+    _git(src, "commit", "-qam", message)
+
+
 def _run(src: Path, mirror: Path, *extra_args: str,
          env_override: dict | None = None) -> subprocess.CompletedProcess:
     """Run the publish script against the fixture."""
@@ -258,6 +290,43 @@ class TestExport(unittest.TestCase):
         self.assertIn("bot/.env.example", exported)
         self.assertIn("docs/notes.md", exported)
         # Clean up the kept tmproot
+        shutil.rmtree(tmproot, ignore_errors=True)
+
+    def test_dotgithub_is_exported(self) -> None:
+        """`.github/` ships (added to PUBLIC_TOPLEVEL 2026-08-31).
+
+        The counterpart to the test below: the fail-closed filter is only worth
+        having if adding a directory to the allowlist is a real, verifiable
+        decision rather than an edit nobody checked. The workflow file is what
+        shows a reader how this project is actually tested.
+        """
+        (self.src / ".github" / "workflows").mkdir(parents=True)
+        (self.src / ".github" / "workflows" / "ci.yml").write_text(
+            "name: CI\non: [push]\n"
+        )
+        _git(self.src, "add", ".github/workflows/ci.yml")
+        _git(self.src, "commit", "-m", "add workflow")
+
+        result = _run(self.src, self.mirror, "--keep-tmp")
+        self.assertEqual(result.returncode, 0,
+                         f"Expected exit 0.\nstdout:{result.stdout}\nstderr:{result.stderr}")
+
+        tmproot = None
+        for line in (result.stdout + result.stderr).splitlines():
+            if "TMPROOT kept at:" in line:
+                tmproot = Path(line.split("TMPROOT kept at:")[1].strip())
+                break
+        self.assertIsNotNone(tmproot, "could not find TMPROOT in output")
+
+        export = tmproot / "export"
+        self.assertTrue(
+            (export / ".github" / "workflows" / "ci.yml").is_file(),
+            ".github/workflows/ci.yml must be part of the export",
+        )
+        self.assertNotIn(
+            "NEW TOP-LEVEL PATH", result.stdout + result.stderr,
+            ".github is on the allowlist; it must not be reported as a new path",
+        )
         shutil.rmtree(tmproot, ignore_errors=True)
 
     def test_ac01_unlisted_toplevel_directory_is_not_exported(self) -> None:
@@ -722,6 +791,150 @@ class TestSelfCheck(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0,
                          f"--self-check failed.\nstdout:{result.stdout}\nstderr:{result.stderr}")
+
+
+
+class TestRefFreshness(unittest.TestCase):
+    """T23: the source ref must be what origin says the branch is.
+
+    The script already refused to trust local state for the destination — it
+    re-fetches the mirror tip before building and verifies the tip after
+    pushing. These pin the same discipline for the source, which is what public
+    commit 19238a3 (a stale tree under an accurate-looking summary) cost us.
+    """
+
+    def setUp(self) -> None:
+        self.src, self.mirror, self.tmp = _make_fixture()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # -- the cases that must refuse ------------------------------------------
+
+    def test_behind_origin_exits_2(self) -> None:
+        _add_source_origin(self.src, self.tmp)
+        _advance_origin(self.src, "origin moved on")
+
+        result = _run(self.src, self.mirror, "--ref", "dev")
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 2,
+                         f"A ref behind origin must abort in preflight.\n{combined}")
+        self.assertIn("BEHIND", combined)
+        self.assertIn("--allow-stale-ref", combined,
+                      "The refusal must name the override")
+
+    def test_behind_origin_publishes_nothing(self) -> None:
+        """The refusal must land before the export, not after it."""
+        _add_source_origin(self.src, self.tmp)
+        _advance_origin(self.src, "origin moved on")
+        tip_before = _mirror_tip(self.mirror)
+
+        _run(self.src, self.mirror, "--ref", "dev")
+
+        self.assertEqual(_mirror_tip(self.mirror), tip_before,
+                         "A stale ref must not reach the mirror")
+
+    def test_ahead_of_origin_exits_2(self) -> None:
+        """Unpushed local work must not reach a public repository."""
+        _add_source_origin(self.src, self.tmp)
+        _commit_locally(self.src, "unpushed local work")
+
+        result = _run(self.src, self.mirror, "--ref", "dev")
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 2,
+                         f"A ref ahead of origin must abort.\n{combined}")
+        self.assertIn("AHEAD", combined)
+
+    def test_diverged_from_origin_exits_2(self) -> None:
+        _add_source_origin(self.src, self.tmp)
+        _advance_origin(self.src, "origin moved on")
+        _git(self.src, "reset", "-q", "--hard", "HEAD")
+        _commit_locally(self.src, "divergent local work")
+
+        result = _run(self.src, self.mirror, "--ref", "dev")
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 2,
+                         f"A diverged ref must abort.\n{combined}")
+        self.assertIn("DIVERGED", combined)
+
+    def test_unreachable_origin_exits_2(self) -> None:
+        """Unknown freshness is not confirmed freshness."""
+        _git(self.src, "remote", "add", "origin",
+             str(self.tmp / "no-such-repo-xyz.git"))
+
+        result = _run(self.src, self.mirror, "--ref", "dev")
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 2,
+                         f"An unreachable origin must abort, not be skipped.\n{combined}")
+        self.assertIn("unknown", combined.lower())
+
+    # -- the cases that must proceed -----------------------------------------
+
+    def test_in_sync_reports_freshness_and_proceeds(self) -> None:
+        _add_source_origin(self.src, self.tmp)
+
+        result = _run(self.src, self.mirror, "--ref", "dev")
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0,
+                         f"A ref in sync with origin must publish.\n{combined}")
+        self.assertIn("freshness", combined,
+                      "A passing check must still say it ran")
+
+    def test_no_origin_remote_is_announced_not_silent(self) -> None:
+        """No origin is not drift — but the log must not look like a pass."""
+        result = _run(self.src, self.mirror, "--ref", "dev")
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, combined)
+        self.assertIn("freshness", combined)
+        self.assertIn("no 'origin' remote", combined)
+
+    def test_ref_absent_on_origin_is_announced_not_silent(self) -> None:
+        _add_source_origin(self.src, self.tmp)
+        _git(self.src, "branch", "local-only", "dev")
+
+        result = _run(self.src, self.mirror, "--ref", "local-only")
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, combined)
+        self.assertIn("does not exist on origin", combined)
+
+    # -- the override --------------------------------------------------------
+
+    def test_allow_stale_ref_overrides_and_warns(self) -> None:
+        _add_source_origin(self.src, self.tmp)
+        _advance_origin(self.src, "origin moved on")
+
+        result = _run(self.src, self.mirror, "--ref", "dev", "--allow-stale-ref")
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0,
+                         f"--allow-stale-ref must permit the publish.\n{combined}")
+        self.assertIn("--allow-stale-ref", combined,
+                      "The override must announce itself, never apply silently")
+
+    def test_source_remote_is_not_env_overridable(self) -> None:
+        """A silent way to disable the check would defeat the flag's purpose."""
+        text = SCRIPT.read_text()
+        self.assertIn('readonly SOURCE_REMOTE="origin"', text)
+        self.assertNotIn("SOURCE_REMOTE:-", text,
+                         "SOURCE_REMOTE must not be env-overridable")
+
+
+class TestDieMessage(unittest.TestCase):
+    """die() printed its exit-code argument as part of the message."""
+
+    def setUp(self) -> None:
+        self.src, self.mirror, self.tmp = _make_fixture()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_exit_code_is_not_appended_to_the_message(self) -> None:
+        result = _run(self.src, self.mirror, "--ref", "nonexistent-branch-xyz-9999")
+        self.assertEqual(result.returncode, 2)
+        fatal = [ln for ln in (result.stdout + result.stderr).splitlines()
+                 if "FATAL" in ln]
+        self.assertTrue(fatal, "expected a FATAL line")
+        self.assertFalse(fatal[0].rstrip().endswith(" 2"),
+                         f"exit code leaked into the message: {fatal[0]!r}")
 
 
 if __name__ == "__main__":

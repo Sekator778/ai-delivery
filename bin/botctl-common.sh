@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # botctl-common.sh — sourced library for botctl-* scripts
 # Callers must set -euo pipefail before sourcing.
 

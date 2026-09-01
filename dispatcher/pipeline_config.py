@@ -82,6 +82,102 @@ _SETTINGS: dict = {
     "hooks": {},
 }
 
+# ── Egress scoping (backlog/T12, opt-in) ───────────────────────────────────
+# A stage child runs `claude --dangerously-skip-permissions` over a repository
+# whose CONTENT is the attack surface (the Comment-and-Control class), and its
+# Bash tool can reach any host on the internet. The env allowlist (#13) closed
+# "leak the key"; it cannot close "leak through a request".
+#
+# The CLI already ships the mechanism: a domain allowlist enforced by a local
+# proxy with a kernel backstop that drops non-loopback traffic at the socket
+# layer (Seatbelt on macOS, bubblewrap on Linux). We do not reimplement it —
+# we configure it, in the settings.json this module already rewrites every run.
+# The design note weighing this against a hand-written Seatbelt profile or our
+# own proxy is STATE/DESIGN-2026-08-21-egress-scoping.md.
+#
+# OFF by default: EGRESS_SCOPING_ENABLED=1 turns it on, and until it is on this
+# module writes exactly the settings it wrote before.
+EGRESS_FLAG = "EGRESS_SCOPING_ENABLED"
+EGRESS_EXTRA = "EGRESS_EXTRA_DOMAINS"
+
+# What a stage legitimately needs to reach. The registries are the honest weak
+# spot — a stage BUILDS its target, so it needs them, and a package publish is
+# a channel this list cannot close. It still narrows "the whole internet" to
+# "vendors plus registries", which is the point.
+EGRESS_BASE_DOMAINS: tuple[str, ...] = (
+    # model endpoints (the CLI's own traffic; LiteLLM, when used, is loopback)
+    "api.anthropic.com",
+    "api.deepseek.com",
+    "api.z.ai",
+    # git + PR
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com",
+    # building and testing the target
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "repo.maven.apache.org",
+    "proxy.golang.org",
+)
+
+
+def egress_enabled() -> bool:
+    return os.environ.get(EGRESS_FLAG, "").strip() == "1"
+
+
+def egress_domains() -> list[str]:
+    """Base list plus EGRESS_EXTRA_DOMAINS (comma-separated).
+
+    Per-target lists from bot/projects.json are deliberately NOT here yet: the
+    settings file is written per RUN, not per target, and threading the target
+    into ensure() to scope it properly is a change worth making once the first
+    smoke run shows which hosts a real target actually needs. Until then the
+    operator widens the list per host with the env var, and the union is at
+    worst as wide as one target's needs."""
+    extra = [d.strip() for d in os.environ.get(EGRESS_EXTRA, "").split(",") if d.strip()]
+    seen: list[str] = []
+    for domain in (*EGRESS_BASE_DOMAINS, *extra):
+        if domain not in seen:
+            seen.append(domain)
+    return seen
+
+
+def _sandbox_settings() -> dict:
+    """The sandbox block. Four of these keys are load-bearing, not cosmetic:
+
+    * ``failIfUnavailable`` — the CLI otherwise WARNS and runs unsandboxed when
+      the sandbox cannot start. A guard that silently turns itself off is the
+      failure mode T01 was about; fail closed instead.
+    * ``allowUnsandboxedCommands: false`` — otherwise the agent has a documented
+      escape hatch (``dangerouslyDisableSandbox``) it may retry a blocked
+      command with. A guard the subject of the guard can lift is not a guard.
+    * ``filesystem.disabled`` — we scope the NETWORK; a stage must still write
+      its worktree. This deliberately keeps only half the sandbox, and the
+      self-escalation risk that comes with it is stated in the design note.
+    * ``allowManagedDomainsOnly`` — otherwise a target repo's own
+      .claude/settings.json could widen the allowlist, and that repo's content
+      is exactly the untrusted input this exists to contain.
+    """
+    return {
+        "enabled": True,
+        "failIfUnavailable": True,
+        "allowUnsandboxedCommands": False,
+        "filesystem": {"disabled": True},
+        "network": {
+            "allowedDomains": egress_domains(),
+            "allowManagedDomainsOnly": True,
+        },
+    }
+
+
+def _settings_payload() -> dict:
+    settings = dict(_SETTINGS)
+    if egress_enabled():
+        settings["sandbox"] = _sandbox_settings()
+    return settings
+
 _SETTINGS_DOC = """\
 This directory is the ai-delivery pipeline's own CLAUDE_CONFIG_DIR. It exists so
 stage subprocesses do not inherit the operator's personal ~/.claude (hooks,
@@ -92,6 +188,11 @@ edit that module, not this file.
 Auth: on macOS credentials live in the login Keychain and nothing here matters
 for it. On Linux/WSL, .credentials.json is copied in from the operator's config
 directory when present.
+
+With EGRESS_SCOPING_ENABLED=1 this file also carries a `sandbox` block: stage
+children may then reach only the allowlisted domains, enforced by the CLI's own
+sandbox (local proxy + kernel backstop). Off by default; see CONTRIBUTING and
+STATE/DESIGN-2026-08-21-egress-scoping.md.
 """
 
 
@@ -128,7 +229,7 @@ def ensure() -> Path:
     try:
         target.mkdir(parents=True, exist_ok=True)
         (target / "settings.json").write_text(
-            json.dumps(_SETTINGS, indent=2) + "\n")
+            json.dumps(_settings_payload(), indent=2) + "\n")
         (target / "README.md").write_text(_SETTINGS_DOC)
         _seed_account(operator_config_dir(), target)
         _seed_credentials(operator_config_dir(), target)

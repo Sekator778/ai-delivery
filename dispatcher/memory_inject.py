@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import urllib.request
@@ -60,8 +61,15 @@ _ENTRY_CHAR_CAP = 700     # per recalled record
 _BLOCK_CHAR_CAP = 4000    # whole injected block — protect the context budget
 
 
+import memory_flat as _flat  # noqa: E402  (flat store, T13 — opt-in)
+
+
 def _env(name: str, default: str) -> str:
     return (os.environ.get(name) or "").strip() or default
+
+
+# macOS per-user $TMPDIR: /var/folders/<2 chars>/<random>/T/...
+_MACOS_TMPDIR_RE = re.compile(r"^/(?:private/)?var/folders/[^/]+/[^/]+/T/")
 
 
 def _is_ephemeral_target(target_repo: str) -> bool:
@@ -96,6 +104,16 @@ def _is_ephemeral_target(target_repo: str) -> bool:
         resolved = os.path.realpath(target_repo)
     except (OSError, ValueError):
         return False
+    # Well-known temp SHAPES, recognised regardless of which host is asking.
+    # gettempdir() answers "is this path ephemeral *here*", but the store is
+    # portable — the JSONL travels in git and gets inspected from Linux, while
+    # the points were written on macOS, whose $TMPDIR is
+    # /var/folders/<xx>/<yyy>/T/. Without this the same record is ephemeral on
+    # one machine and legitimate on another, which made a purge run from the
+    # wrong host silently find nothing (backlog/T20).
+    if _MACOS_TMPDIR_RE.match(resolved):
+        return True
+
     for root in {tempfile.gettempdir(), "/tmp"}:
         try:
             root_resolved = os.path.realpath(root)
@@ -144,11 +162,18 @@ def _embed(text: str) -> "list[float] | None":
 
 def _search(vector: "list[float]", limit: int,
             target_repo: "str | None" = None) -> "list[dict]":
-    body: dict = {"vector": vector, "limit": limit, "with_payload": True}
     try:
-        body["score_threshold"] = float(_env("MEMORY_MIN_SCORE", "0.4"))
+        min_score = float(_env("MEMORY_MIN_SCORE", "0.4"))
     except ValueError:
-        body["score_threshold"] = 0.4
+        min_score = 0.4
+    # T13: with the flat store on, the same ranking happens over a JSONL file
+    # and Qdrant is not contacted at all. 3.16 MB of vectors and ~70 ms per
+    # scan replace 600 MB and a service; see memory_flat and the ROADMAP
+    # verdict. Off by default — the branch below is the unchanged path.
+    if _flat.enabled():
+        return _flat.search(vector, limit, target_repo, min_score)
+    body: dict = {"vector": vector, "limit": limit, "with_payload": True}
+    body["score_threshold"] = min_score
     if target_repo:
         body["filter"] = {"must": [
             {"key": "target_repo", "match": {"value": target_repo}}]}
@@ -181,6 +206,65 @@ def recall(query: str, target_repo: str) -> "list[dict]":
                 seen.add(hit.get("id"))
                 hits.append(hit)
     return hits[:top_k]
+
+
+def remember(text: str, *, source: str = "telegram",
+             extra: "dict | None" = None) -> "str | None":
+    """Store one free-form fact. Returns the point id, or None on failure.
+
+    The bot's /memo used to embed with FastEmbed and PUT into Qdrant itself,
+    which meant two embedding models writing into one collection (the pipeline
+    uses TEI/bge-m3) and a command that broke the moment Qdrant stopped. Both
+    problems disappear by going through this module: same embedder, same store,
+    flat or Qdrant depending on the flag."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    vector = _embed(text)
+    if not vector:
+        return None
+    point_id = str(uuid.uuid4())
+    point = {
+        "id": point_id,
+        "vector": vector,
+        "payload": {
+            "kind": "note",
+            "source": source,
+            "text": text,
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            **(extra or {}),
+        },
+    }
+    if _flat.enabled():
+        return point_id if _flat.append(point) else None
+    out = _post_json(
+        f"{_env('MEMORY_QDRANT_URL', 'http://127.0.0.1:6333')}/collections/"
+        f"{_env('MEMORY_COLLECTION', 'meta_agent_mem')}/points?wait=true",
+        {"points": [point]}, method="PUT")
+    return point_id if isinstance(out, dict) and out.get("status") == "ok" else None
+
+
+def search_text(query: str, limit: int = 5,
+                min_score: float = 0.0) -> "list[dict]":
+    """Unfiltered semantic search — what /recall shows the operator.
+
+    Separate from recall(): that one is the pipeline's two-pass, target-scoped
+    lookup with a score floor tuned for prompt injection. A human asking
+    "what do I know about X" wants everything ranked, not a filtered subset."""
+    vector = _embed(query)
+    if not vector:
+        return []
+    if _flat.enabled():
+        return _flat.search(vector, limit, None, min_score)
+    body = {"vector": vector, "limit": limit, "with_payload": True}
+    if min_score:
+        body["score_threshold"] = min_score
+    out = _post_json(
+        f"{_env('MEMORY_QDRANT_URL', 'http://127.0.0.1:6333')}/collections/"
+        f"{_env('MEMORY_COLLECTION', 'meta_agent_mem')}/points/search", body)
+    if isinstance(out, dict) and isinstance(out.get("result"), list):
+        return out["result"]
+    return []
 
 
 def format_block(hits: "list[dict]") -> str:
@@ -266,6 +350,11 @@ def write_back(*, task_id: str, target_repo: str, spec_prompt: str,
             "text": text,
         },
     }
+    if _flat.enabled():
+        if not _flat.append(point):
+            return False
+        _retire_over_cap(target_repo)
+        return True
     out = _post_json(
         f"{_env('MEMORY_QDRANT_URL', 'http://127.0.0.1:6333')}/collections/"
         f"{_env('MEMORY_COLLECTION', 'meta_agent_mem')}/points?wait=true",
@@ -284,6 +373,12 @@ def _retire_over_cap(target_repo: str) -> None:
         cap = int(_env("MEMORY_TARGET_CAP", "200"))
     except ValueError:
         cap = 200
+    if _flat.enabled():
+        dropped = _flat.retire_over_cap(target_repo, cap)
+        if dropped:
+            print(f"[memory-inject] retired {dropped} task_lesson point(s) over "
+                  f"the {cap} cap for {target_repo}", file=sys.stderr)
+        return
     base = (f"{_env('MEMORY_QDRANT_URL', 'http://127.0.0.1:6333')}/collections/"
             f"{_env('MEMORY_COLLECTION', 'meta_agent_mem')}/points")
     flt = {"must": [

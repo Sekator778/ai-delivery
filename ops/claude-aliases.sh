@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Claude Code backend aliases for WSL Ubuntu (zsh/bash compatible).
 # Mirror of the Windows PowerShell profile functions
 # (Use-ClaudeDeepSeek / claude-anthropic).
