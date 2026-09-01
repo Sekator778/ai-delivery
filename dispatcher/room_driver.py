@@ -87,6 +87,79 @@ Notify = Callable[..., Awaitable[None]]
 _RESULT_COST_RE = re.compile(r'"total_cost_usd"\s*:\s*([0-9.]+)')
 
 
+def extract_result_event(output: str) -> "dict | None":
+    """The `{"type":"result", ...}` line of a stream-json run, or None.
+
+    run_subtask hands back the child's whole stdout: hook and system events,
+    assistant messages, then the result event. That matters more than it
+    sounds. T28 fed the raw stream straight to the decision parser, which looks
+    for the first balanced {...} and therefore found
+    `{"type":"system","subtype":"hook_started"}` — no `action` field, so every
+    turn came back "unparseable", including the perfectly good delegation the
+    conductor produced on the live run.
+
+    The model's own final text is the `result` field of this event; the tokens
+    are in its `usage`. Scanned from the end because the result event is last
+    and a long run has thousands of lines before it.
+    """
+    if not output:
+        return None
+    for line in reversed(output.splitlines()):
+        line = line.strip()
+        if not line.startswith("{") or '"result"' not in line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and parsed.get("type") == "result":
+            return parsed
+    return None
+
+
+def decision_text(output: str) -> str:
+    """What to hand the decision parser.
+
+    The result event's `result` field when there is one; otherwise the raw
+    output, which keeps the honest failure path from T28 intact — a child that
+    crashed before emitting a result event has no decision to extract, and
+    saying so is better than inventing one.
+    """
+    event = extract_result_event(output)
+    if event is None:
+        return output
+    text = event.get("result")
+    return text if isinstance(text, str) and text.strip() else output
+
+
+# Token names differ between the CLI's result event and the ledger's pricing
+# helper, and the cache columns are not optional decoration: cache writes are
+# billed at full input rates and cache reads at a fraction, so dropping either
+# skews the total in a direction nobody would notice.
+_USAGE_KEY_MAP = {
+    "input_tokens": "input_tokens",
+    "output_tokens": "output_tokens",
+    "cache_read_input_tokens": "cache_read_tokens",
+    "cache_creation_input_tokens": "cache_creation_tokens",
+}
+
+
+def _flatten_usage(event: dict) -> dict:
+    """Lift `usage` onto the top level under the names apply_backend_pricing reads."""
+    flat = {"total_cost_usd": event.get("total_cost_usd")}
+    usage = event.get("usage")
+    if isinstance(usage, dict):
+        for src, dst in _USAGE_KEY_MAP.items():
+            if src in usage:
+                flat[dst] = usage[src]
+    # A flat event (older CLI, or a hand-built fixture) already uses these names.
+    for key in ("input_tokens", "output_tokens",
+                "cache_read_tokens", "cache_creation_tokens"):
+        if key in event and key not in flat:
+            flat[key] = event[key]
+    return flat
+
+
 def parse_cost(output: str, backend: str) -> "tuple[float, str]":
     """Cost of one child, in the provider's own money.
 
@@ -100,25 +173,21 @@ def parse_cost(output: str, backend: str) -> "tuple[float, str]":
     if not output:
         return 0.0, "no-output"
 
-    payload: dict = {}
-    for line in reversed(output.splitlines()):
-        if '"total_cost_usd"' not in line:
-            continue
-        try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError:
+    event = extract_result_event(output)
+    payload = _flatten_usage(event) if event else {}
+
+    if not payload or payload.get("total_cost_usd") is None:
+        # No usable result event: fall back to scraping a cost out of any line
+        # that carries one, rather than reporting zero for a run that spent.
+        for line in reversed(output.splitlines()):
+            if '"total_cost_usd"' not in line:
+                continue
             match = _RESULT_COST_RE.search(line)
             if match:
                 try:
                     return float(match.group(1)), "cli-regex"
                 except ValueError:
                     pass
-            continue
-        if isinstance(parsed, dict):
-            payload = parsed
-            break
-
-    if not payload:
         return 0.0, "no-cost-line"
 
     try:
@@ -252,7 +321,7 @@ async def run_room(
         spent += cost
         _record_cost(conductor_id, CONDUCTOR_STAGE, CONDUCTOR_BACKEND, cost, source)
 
-        decision = room.interpret(result.output, history)
+        decision = room.interpret(decision_text(result.output), history)
 
         if not decision.ok:
             parse_retries += 1

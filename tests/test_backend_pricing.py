@@ -22,8 +22,9 @@ sys.path.insert(0, str(REPO_ROOT / "dispatcher"))
 from backend_routing import apply_backend_pricing  # noqa: E402
 
 # input=1000, output=2000, cache_read=1M, cache_write=0 at deepseek-v4-pro
-# rates (0.435 / 0.87 / 0.003625 per 1M): 0.000435 + 0.00174 + 0.003625
-_PRO_EXPECTED = 0.0058
+# rates effective 2026-08-17 (1.32 / 3.96 / 0.044 per 1M):
+# 0.00132 + 0.00792 + 0.044
+_PRO_EXPECTED = 0.05324
 
 _USAGE = {
     "total_cost_usd": 1.12,
@@ -54,8 +55,8 @@ class DeepseekPricingTests(unittest.TestCase):
     def test_primary_model_env_selects_the_price_row(self) -> None:
         os.environ["DEEPSEEK_MODEL_PRIMARY"] = "deepseek-v4-flash"
         out = apply_backend_pricing("deepseek", _USAGE)
-        # 0.00014 + 0.00056 + 0.0028 at flash rates
-        self.assertAlmostEqual(out["total_cost_usd"], 0.0035, places=9)
+        # 0.00044 + 0.00264 + 0.014 at flash rates (2026-08-17)
+        self.assertAlmostEqual(out["total_cost_usd"], 0.01708, places=9)
         self.assertEqual(out["cost_source"], "computed:deepseek-v4-flash")
 
     def test_prices_json_override_wins(self) -> None:
@@ -75,7 +76,8 @@ class DeepseekPricingTests(unittest.TestCase):
     def test_missing_token_fields_count_as_zero(self) -> None:
         out = apply_backend_pricing(
             "deepseek", {"total_cost_usd": 0.5, "output_tokens": 2000})
-        self.assertAlmostEqual(out["total_cost_usd"], 0.00174, places=9)
+        # 2000 output tokens at 3.96/M, everything else absent = 0
+        self.assertAlmostEqual(out["total_cost_usd"], 0.00792, places=9)
 
     def test_input_is_not_mutated(self) -> None:
         original = dict(_USAGE)

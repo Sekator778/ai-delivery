@@ -47,6 +47,26 @@ reference implementations, and cut into briefs (backlog/T25, T26).
   (strategy memory distilled from successes AND failures). Briefs cut:
   T25 (conductor MVP), T26 (strategy memory over the flat store).
 
+- **The room reads the CLI's result event instead of its raw stream**
+  (backlog/T29). T28 handed the whole stream-json stdout to the decision
+  parser, which takes the first balanced object — a CLI hook event, with no
+  `action` field — so every conductor turn came back unparseable, including a
+  perfectly good delegation on the live run. The decision now comes from the
+  result event's `result` field, and cost from its `usage`, with both cache
+  columns mapped to the names the pricing helper reads. A child that crashed
+  before emitting a result event keeps the honest failure path.
+  The lesson is the mock/reality seam: every T28 test fed clean JSON, so the
+  suite was green while the live room could not read a single turn. Those tests
+  stay — they cover the protocol — and new ones use the shape the CLI actually
+  emits, including one that pins that the raw stream does *not* parse, so the
+  extractor is not removed as noise later.
+- **The built-in DeepSeek price table matched the operator's override at
+  last.** atlas priced correctly through `BACKEND_PRICES_JSON`; every clone
+  without it — CI included — computed on pre-17-August rates and understated
+  DeepSeek spend roughly threefold, silently, because a wrong number in a
+  ledger looks like a right one. Found by an arithmetic disagreement between
+  the T29 brief and the code, where the brief was right.
+
 - **The room now drives its loop past turn one** (backlog/T28). T25 shipped the
   conductor and no driver: on the live run it returned a valid delegation for
   $0.178 and then nothing happened — `room_command` ended at `run_subtask` and

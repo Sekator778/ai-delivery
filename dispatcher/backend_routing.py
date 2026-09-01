@@ -508,11 +508,21 @@ def _subagent_env(backend: str, stage: "str | None" = None, *,
 # instead of silently wrong, and fixing it is adding a dict entry.
 
 _BACKEND_PRICES: "dict[str, dict[str, dict[str, float]]]" = {
+    # DeepSeek rates effective 2026-08-17, recorded at PEAK deliberately — an
+    # upper bound for cost caps, not billing; peak windows 01:00-04:00 &
+    # 06:00-10:00 UTC. Same wording, same numbers as the operator's
+    # BACKEND_PRICES_JSON override, so code and env say one thing.
+    #
+    # They previously did not. atlas carried the override and priced correctly;
+    # any clone without it — this container, CI, a fresh checkout — computed on
+    # the pre-August table and understated DeepSeek spend roughly 3x. Found
+    # while chasing a room-budget discrepancy in T29: the brief's arithmetic and
+    # the code's disagreed, and the code was the one that was wrong.
     "deepseek": {
-        "deepseek-v4-pro":   {"input": 0.435, "output": 0.87,
-                              "cache_read": 0.003625, "cache_write": 0.435},
-        "deepseek-v4-flash": {"input": 0.14, "output": 0.28,
-                              "cache_read": 0.0028, "cache_write": 0.14},
+        "deepseek-v4-pro":   {"input": 1.32, "output": 3.96,
+                              "cache_read": 0.044, "cache_write": 1.32},
+        "deepseek-v4-flash": {"input": 0.44, "output": 1.32,
+                              "cache_read": 0.014, "cache_write": 0.44},
     },
 }
 

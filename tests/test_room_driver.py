@@ -284,6 +284,129 @@ class SpecialistFailureTests(unittest.TestCase):
         self.assertIn("failed (rc=1)", harness.spawned[2]["prompt"])
 
 
+class LiveStreamShapeTests(unittest.TestCase):
+    """The seam the mocks missed: real stdout is a stream, not a decision.
+
+    Every T28 test fed the driver a clean JSON reply, so the whole suite was
+    green while the live room could not read a single turn. run_subtask hands
+    back the child's entire stream-json stdout, and the decision parser takes
+    the first balanced {...} — which is a CLI hook event, not the conductor's
+    answer. These tests use the shape the CLI actually emits.
+
+    The event below follows the live run of 2026-09-01 (T29 brief): the model's
+    final text lives in `result`, the tokens in `usage`, and the cache counters
+    carry different names from the ones the pricing helper reads.
+    """
+
+    DECISION = json.dumps({
+        "action": "delegate",
+        "reasoning": "the owner needs a written shortlist",
+        "params": {
+            "task_instruction": "Draft a shortlist of hybrid estates",
+            "context": "",
+            "tools_profile": "documents",
+            "model": "model_2",
+        },
+    })
+
+    def _stream(self, decision: "str | None" = None, cost: float = 0.252065) -> str:
+        lines = [
+            json.dumps({"type": "system", "subtype": "hook_started",
+                        "hook": "SessionStart"}),
+            json.dumps({"type": "assistant",
+                        "message": {"content": [{"type": "text", "text": "working"}]}}),
+            json.dumps({
+                "type": "result",
+                "total_cost_usd": cost,
+                "usage": {"input_tokens": 26293, "output_tokens": 4824,
+                          "cache_read_input_tokens": 0,
+                          "cache_creation_input_tokens": 0},
+                "modelUsage": {"deepseek-v4-pro": {"costUSD": cost}},
+                "result": self.DECISION if decision is None else decision,
+            }),
+        ]
+        return "\n".join(lines)
+
+    def test_the_decision_is_read_from_the_result_event(self) -> None:
+        """The bug: the raw stream parsed to the CLI's first hook event."""
+        turn = room.interpret(driver.decision_text(self._stream()), room.History())
+        self.assertTrue(turn.ok, f"live-shaped output must parse: {turn.error}")
+        self.assertEqual(turn.action, "delegate")
+
+    def test_the_raw_stream_would_not_have_parsed(self) -> None:
+        """Pins why the extractor exists, so nobody removes it as noise."""
+        turn = room.interpret(self._stream(), room.History())
+        self.assertFalse(turn.ok)
+
+    def test_cost_is_computed_from_usage_not_taken_from_the_cli(self) -> None:
+        usd, source = driver.parse_cost(self._stream(), "deepseek")
+        self.assertEqual(source, "computed:deepseek-v4-pro")
+        # Range, not a magic number: the rate table is the authority and may be
+        # revised. What must hold is that the CLI's Anthropic-priced figure was
+        # not passed through — it overstated this turn several times over.
+        self.assertLess(usd, 0.10)
+        self.assertGreater(usd, 0.01)
+        self.assertLess(usd, 0.252065 / 3)
+
+    def test_both_cache_columns_reach_the_pricing_helper(self) -> None:
+        """Cache writes bill at input rates; dropping them skews the total."""
+        event = {"total_cost_usd": 1.0,
+                 "usage": {"input_tokens": 1, "output_tokens": 2,
+                           "cache_read_input_tokens": 3,
+                           "cache_creation_input_tokens": 4}}
+        flat = driver._flatten_usage(event)
+        self.assertEqual(flat["cache_read_tokens"], 3)
+        self.assertEqual(flat["cache_creation_tokens"], 4)
+
+    def test_a_flat_event_without_usage_still_prices(self) -> None:
+        """Older CLI shapes and hand-built fixtures put tokens at the top level."""
+        line = json.dumps({"type": "result", "total_cost_usd": 9.99,
+                           "input_tokens": 1000, "output_tokens": 1000,
+                           "result": self.DECISION})
+        usd, source = driver.parse_cost(line, "deepseek")
+        self.assertTrue(source.startswith("computed:"), source)
+
+    def test_no_result_event_keeps_the_honest_failure_path(self) -> None:
+        """A crashed child has no decision to extract; say so, do not invent."""
+        crashed = "EXCEPTION: RuntimeError('boom')"
+        self.assertEqual(driver.decision_text(crashed), crashed)
+        turn = room.interpret(driver.decision_text(crashed), room.History())
+        self.assertFalse(turn.ok)
+
+    def test_the_reprompt_protocol_still_works_over_the_extractor(self) -> None:
+        """Regression: T28's two-strike stop must survive the new plumbing."""
+        harness = _Harness([
+            self._stream(decision="I would rather explain than emit JSON"),
+            self._stream(decision=json.dumps({"action": "finish", "reasoning": "r",
+                                              "params": {"summary": "done"}})),
+        ])
+        outcome = _run(harness, tempfile.mkdtemp(), budget_usd=5.0, max_turns=5)
+        self.assertEqual(outcome.status, "finished")
+        self.assertEqual(len(harness.spawned), 2, "one reprompt, then success")
+
+    def test_two_bad_result_events_still_stop_honestly(self) -> None:
+        harness = _Harness([
+            self._stream(decision="prose one"),
+            self._stream(decision="prose two"),
+        ])
+        outcome = _run(harness, tempfile.mkdtemp(), budget_usd=5.0, max_turns=5)
+        self.assertEqual(outcome.status, "unparseable")
+        self.assertIn("не разобрать", harness.all_text)
+
+    def test_a_full_run_on_live_shaped_output_reaches_finish(self) -> None:
+        harness = _Harness([
+            self._stream(),                                   # conductor: delegate
+            self._stream(decision="specialist notes", cost=0.03),
+            self._stream(decision=json.dumps({"action": "finish", "reasoning": "r",
+                                              "params": {"summary": "shortlist ready"}}),
+                         cost=0.02),
+        ])
+        outcome = _run(harness, tempfile.mkdtemp(), budget_usd=5.0, max_turns=5)
+        self.assertEqual(outcome.status, "finished")
+        self.assertEqual(outcome.delegations, 1)
+        self.assertIn("shortlist ready", harness.all_text)
+
+
 class CostParsingTests(unittest.TestCase):
     """Budget in the provider's currency, not the CLI's Anthropic prices."""
 
